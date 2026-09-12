@@ -125,6 +125,20 @@ def iter_segments(points: list[Point], close: bool) -> "object":
         yield n - 1, (points[n - 1], points[0])
 
 
+def polygon_is_degenerate(points: list[Point]) -> bool:
+    """判断隐式闭合多边形是否退化为零面积（所有有效顶点共线）。
+
+    使用有向面积的二倍（鞋带公式）判断；相邻重复点等结构错误由调用方先拦截。
+    """
+    double_area = 0.0
+    n = len(points)
+    for i in range(n):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % n]
+        double_area += x1 * y2 - y1 * x2
+    return double_area == 0.0
+
+
 def polygon_self_intersects(points: list[Point]) -> tuple[int, int] | None:
     """检查隐式闭合多边形是否自交（含非相邻边接触）。
 

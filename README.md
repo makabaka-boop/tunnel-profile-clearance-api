@@ -59,7 +59,7 @@ docker compose up --build
 python3.12 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload
-pytest                 # 66 项测试
+pytest                 # 71 项测试
 BASE_URL=http://127.0.0.1:8000 python scripts/acceptance.py
 ```
 
@@ -82,6 +82,7 @@ BASE_URL=http://127.0.0.1:8000 python scripts/acceptance.py
 - 坐标必须是整数且 `|x|,|y| <= 1,000,000`，净距 `|required_clearance| <= 1,000,000`；
 - 同一形状内相邻点不得相同（错误定位到重复点的下标）；
 - 多边形不得把首点重复为末点（首尾隐式闭合）；
+- 多边形有效顶点不得全部共线形成零面积轮廓（隐式闭合边会与其它边重叠）；
 - 多边形不得自交（含非相邻边接触），错误信息给出自交的两条边索引；
 - 禁止多余字段。
 
@@ -166,7 +167,7 @@ curl -s http://localhost:8000/api/clearance/check \
 
 | 字段 | 说明 |
 | --- | --- |
-| `placements[].name` | 位置名称，非空字符串，**同一批次内唯一** |
+| `placements[].name` | 位置名称，非空且不能只含空白/控制字符，**同一批次内唯一** |
 | `placements[].dx` / `placements[].dy` | 车辆限界整体的横/纵平移量（毫米，**整数**） |
 
 每个位置先把车辆顶点平移 `(dx, dy)`（隧道折线不动），再按与 `check` 完全相同的
@@ -197,7 +198,9 @@ curl -s http://localhost:8000/api/clearance/check \
 
 批量特有的 `422` 校验（错误**定位到具体位置或偏移字段**）：
 
+- 名称仅含空白或控制字符：`blank_placement_name`，定位到 `placements.<下标>.name`；
 - 名称重复：`duplicate_placement_name`，定位到 `placements.<下标>.name`（重复出现的后者）；
+- 名称重复与偏移类型错误同时出现时，两个错误会一并返回；
 - 列表为空 / 超过 50 个：`too_short` / `too_long`，定位到 `placements`；
 - 平移后任一车辆顶点坐标越过 ±1,000,000：`translated_coordinate_out_of_range`，
   定位到 `placements.<下标>.dx` 或 `placements.<下标>.dy`。
@@ -218,6 +221,8 @@ curl -s http://localhost:8000/api/clearance/check \
   ① 隧道线段起点索引 ② 限界边起点索引，取较小者；差超过 `1e-9` 则更近者胜。
 - 自交检查只针对限界多边形，且跳过相邻边（相邻边共享端点是正常的）；
   非相邻边接触也判自交。
+- 退化检查也只针对限界多边形：所有有效顶点共线导致面积为零时拒绝；此时隐式
+  闭合边会与其它边重叠，不能进入净距计算。
 
 ## 测试
 
@@ -227,6 +232,7 @@ pytest
 
 覆盖内容包括：普通交叉 / T 形 / 端点相接 / 共线重叠的相交判定，垂足在线段内外的
 点线距离，自交多边形（蝴蝶结、非相邻边接触）与凹多边形，并列 `1e-9` 阈值的两侧边界，
-闭合边成为最危险边，大坐标双精度，`ROUND_HALF_UP` 的 `.0005` 进位，
+闭合边成为最危险边，零面积共线轮廓拒绝，大坐标双精度，`ROUND_HALF_UP` 的 `.0005` 进位，
 未舍入门槛，全部字段级错误定位，以及批量位置复核（全过 / 首个失败不中断 /
-相交位置 / 平移越界与重名的字段级错误 / 数量边界 / 与单点接口结论一致）。
+相交位置 / 空白名称 / 平移越界与重名的字段级错误 / 重名与偏移错误同时返回 /
+数量边界 / 与单点接口结论一致）。

@@ -435,7 +435,86 @@ def main() -> int:
         types = {e["type"] for e in body["detail"]}
         check("case11c 含 too_long", "too_long" in types, str(types))
 
-    # 12. 旧接口典型请求响应保持不变（精确匹配完整响应体）
+    # 12. 批量输入校验：空白名称、共线零面积车辆轮廓、重名与偏移类型错误同时报告
+    series_base = {
+        "tunnel_polyline": {
+            "points": [
+                {"x": 0, "y": 0},
+                {"x": 0, "y": 1200},
+                {"x": 1000, "y": 1200},
+                {"x": 1000, "y": 0},
+            ]
+        },
+        "vehicle_polygon": {
+            "points": [
+                {"x": 200, "y": 200},
+                {"x": 800, "y": 200},
+                {"x": 800, "y": 1000},
+                {"x": 200, "y": 1000},
+            ]
+        },
+        "required_clearance": 150,
+    }
+    status, body = post(
+        "/api/clearance/check-series",
+        {**series_base, "placements": [{"name": "  \t\n", "dx": 0, "dy": 0}]},
+    )
+    check("case12a status 422（空白位置名称）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check("case12a 含 blank_placement_name", "blank_placement_name" in types, str(types))
+        check(
+            "case12a 定位到 placements.0.name",
+            "body -> placements -> 0 -> name" in locs,
+            str(locs),
+        )
+
+    status, body = post(
+        "/api/clearance/check-series",
+        {
+            **series_base,
+            "vehicle_polygon": {
+                "points": [
+                    {"x": 0, "y": 100},
+                    {"x": 500, "y": 100},
+                    {"x": 1000, "y": 100},
+                ]
+            },
+            "placements": [{"name": "line", "dx": 0, "dy": 0}],
+        },
+    )
+    check("case12b status 422（三点共线零面积轮廓）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        check("case12b 含 degenerate_polygon", "degenerate_polygon" in types, str(types))
+
+    status, body = post(
+        "/api/clearance/check-series",
+        {
+            **series_base,
+            "placements": [
+                {"name": "a", "dx": 0, "dy": 0},
+                {"name": "a", "dx": 1.5, "dy": 0},
+            ],
+        },
+    )
+    check("case12c status 422（重名且偏移非整数）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check(
+            "case12c 同时含重名与整数类型错误",
+            "duplicate_placement_name" in types and "int_type" in types,
+            str(types),
+        )
+        check(
+            "case12c 同时定位到名称和横向偏移",
+            "body -> placements -> 1 -> name" in locs and "body -> placements -> 1 -> dx" in locs,
+            str(locs),
+        )
+
+    # 13. 旧接口典型请求响应保持不变（精确匹配完整响应体）
     status, body = post(
         "/api/clearance/check",
         {

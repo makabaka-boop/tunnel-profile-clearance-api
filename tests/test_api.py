@@ -242,6 +242,28 @@ def test_repeated_first_point_rejected_with_field_location():
     assert "repeated_first_point" in types
 
 
+def test_collinear_closed_vehicle_polygon_rejected():
+    resp = post_series(
+        {
+            "tunnel_polyline": {"points": [{"x": 0, "y": 0}, {"x": 1000, "y": 0}]},
+            "vehicle_polygon": {
+                "points": [
+                    {"x": 0, "y": 100},
+                    {"x": 500, "y": 100},
+                    {"x": 1000, "y": 100},
+                ]
+            },
+            "required_clearance": 10,
+            "placements": [{"name": "a", "dx": 0, "dy": 0}],
+        }
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert any(e["type"] == "degenerate_polygon" for e in detail)
+    assert any(e["loc"][:3] == ["body", "vehicle_polygon", "points"] for e in detail)
+    assert "results" not in resp.json()
+
+
 def test_self_intersecting_polygon_rejected():
     resp = post(
         {
@@ -636,6 +658,35 @@ def test_series_translated_coordinate_out_of_range():
     # 恰好平移到边界 ±1,000,000 是合法的
     resp3 = post_series(series_payload([{"name": "edge", "dx": 999_200, "dy": 0}]))
     assert resp3.status_code == 200
+
+
+def test_series_blank_placement_name_rejected():
+    for name in [" ", "\t", "\n", "\r\n", " "]:
+        resp = post_series(series_payload([{"name": name, "dx": 0, "dy": 0}]))
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert any(e["type"] == "blank_placement_name" for e in detail)
+        assert "body -> placements -> 0 -> name" in _locs(resp)
+        assert "results" not in resp.json()
+
+
+def test_series_duplicate_name_and_invalid_offset_reported_together():
+    resp = post_series(
+        series_payload(
+            [
+                {"name": "a", "dx": 0, "dy": 0},
+                {"name": "a", "dx": 1.5, "dy": 0},
+            ]
+        )
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    types = {e["type"] for e in detail}
+    assert "duplicate_placement_name" in types
+    assert "int_type" in types
+    locs = _locs(resp)
+    assert "body -> placements -> 1 -> name" in locs
+    assert "body -> placements -> 1 -> dx" in locs
 
 
 def test_series_duplicate_names_rejected():

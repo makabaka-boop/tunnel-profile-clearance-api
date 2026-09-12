@@ -9,6 +9,7 @@ from app.geometry import (
     iter_segments,
     minimum_segment_pair,
     point_segment_distance,
+    polygon_is_degenerate,
     polygon_self_intersects,
     round_three,
     segment_distance,
@@ -116,6 +117,16 @@ def test_iter_segments_open_vs_closed():
 def test_triangle_not_self_intersecting():
     tri = [pt(0, 0), pt(1000, 0), pt(0, 1000)]
     assert polygon_self_intersects(tri) is None
+
+
+def test_collinear_polygon_is_degenerate():
+    # 三点共线时，隐式闭合边与前序边重叠，车辆轮廓面积为零
+    shape = [pt(0, 0), pt(500, 0), pt(1000, 0)]
+    assert polygon_is_degenerate(shape)
+
+
+def test_non_degenerate_triangle_has_area():
+    assert not polygon_is_degenerate([pt(0, 0), pt(1000, 0), pt(0, 1000)])
 
 
 def test_bowtie_self_intersecting():

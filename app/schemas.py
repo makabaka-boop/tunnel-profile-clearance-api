@@ -13,7 +13,7 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
-from .geometry import polygon_self_intersects
+from .geometry import polygon_is_degenerate, polygon_self_intersects
 
 COORD_LIMIT = 1_000_000
 MIN_POINTS_POLYLINE = 2
@@ -93,7 +93,7 @@ def _shape_errors(
                 }
             )
 
-    # 多边形不得自交（点结构有效时才检查，避免对脏数据重复报错）
+    # 多边形几何检查（点结构有效时才检查，避免对脏数据重复报错）
     if closed_polygon and len(points) >= MIN_POINTS_POLYGON and not line:
         raw = [(float(p.x), float(p.y)) for p in points]
         pair = polygon_self_intersects(raw)
@@ -104,6 +104,16 @@ def _shape_errors(
                     "type": PydanticCustomError(
                         "self_intersecting_polygon",
                         f"{shape_label}自交：第 {i} 边与第 {j} 边相交或接触",
+                    ),
+                    "loc": ("points",),
+                }
+            )
+        elif polygon_is_degenerate(raw):
+            line.append(
+                {
+                    "type": PydanticCustomError(
+                        "degenerate_polygon",
+                        f"{shape_label}面积为零：有效顶点全部共线，隐式闭合边与其它边重叠，不得作为车辆轮廓",
                     ),
                     "loc": ("points",),
                 }
@@ -176,6 +186,66 @@ class Placement(BaseModel):
     dx: StrictInt = Field(..., description="X 方向平移量（毫米，整数）")
     dy: StrictInt = Field(..., description="Y 方向平移量（毫米，整数）")
 
+    @field_validator("name")
+    @classmethod
+    def _check_name_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise PydanticCustomError(
+                "blank_placement_name",
+                "摆放位置名称不能为空白字符，必须包含有效名称",
+            )
+        return value
+
+
+def _validate_placements_field(value: object, handler) -> list[Placement]:
+    """校验摆放位置列表，并在嵌套字段错误时仍收集批次级重名错误。"""
+    try:
+        return handler(value)
+    except ValidationError as exc:
+        line_errors: list[dict] = []
+
+        if isinstance(value, list):
+            seen: dict[str, int] = {}
+            for idx, item in enumerate(value):
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if not isinstance(name, str):
+                    continue
+                first = seen.get(name)
+                if first is not None:
+                    line_errors.append(
+                        {
+                            "type": PydanticCustomError(
+                                "duplicate_placement_name",
+                                f"摆放位置名称重复：{name}（首次出现于第 {first} 个位置），名称必须唯一",
+                            ),
+                            "loc": (idx, "name"),
+                        }
+                    )
+                else:
+                    seen[name] = idx
+
+            for error in exc.errors():
+                loc = tuple(
+                    part
+                    for part in error.get("loc", ())
+                    if part != "" and part != "placements"
+                )
+                line_errors.append(
+                    {
+                        "type": PydanticCustomError(
+                            str(error["type"]),
+                            str(error["msg"]),
+                        ),
+                        "loc": loc,
+                    }
+                )
+
+        if not line_errors:
+            raise
+        raise ValidationError.from_exception_data(ClearanceSeriesRequest.__name__, line_errors) from exc
+
 
 class ClearanceSeriesRequest(BaseModel):
     """批量摆放位置的限界复核请求：同一隧道断面与车辆限界，多个平移位置。"""
@@ -196,6 +266,11 @@ class ClearanceSeriesRequest(BaseModel):
         max_length=50,
         description="摆放位置列表（1~50 个），按输入顺序逐一复核",
     )
+
+    @field_validator("placements", mode="wrap")
+    @classmethod
+    def _validate_placements_field(cls, value: object, handler) -> list[Placement]:
+        return _validate_placements_field(value, handler)
 
     @model_validator(mode="after")
     def _validate_placements(self) -> "ClearanceSeriesRequest":
