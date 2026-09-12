@@ -167,6 +167,95 @@ class ClearanceRequest(BaseModel):
     )
 
 
+class Placement(BaseModel):
+    """单个摆放位置：唯一名称 + 车辆限界的整数平移量（毫米）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, description="摆放位置名称，同一批次内唯一")
+    dx: StrictInt = Field(..., description="X 方向平移量（毫米，整数）")
+    dy: StrictInt = Field(..., description="Y 方向平移量（毫米，整数）")
+
+
+class ClearanceSeriesRequest(BaseModel):
+    """批量摆放位置的限界复核请求：同一隧道断面与车辆限界，多个平移位置。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tunnel_polyline: TunnelProfile
+    vehicle_polygon: VehicleGauge
+    required_clearance: StrictInt = Field(
+        ...,
+        ge=-COORD_LIMIT,
+        le=COORD_LIMIT,
+        description="要求净距（毫米，整数，|required_clearance| <= 1,000,000）",
+    )
+    placements: list[Placement] = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description="摆放位置列表（1~50 个），按输入顺序逐一复核",
+    )
+
+    @model_validator(mode="after")
+    def _validate_placements(self) -> "ClearanceSeriesRequest":
+        errors: list[dict] = []
+
+        # 名称在同一批次内唯一（定位到重复出现的后者）
+        seen: dict[str, int] = {}
+        for idx, placement in enumerate(self.placements):
+            first = seen.get(placement.name)
+            if first is not None:
+                errors.append(
+                    {
+                        "type": PydanticCustomError(
+                            "duplicate_placement_name",
+                            f"摆放位置名称重复：{placement.name}（首次出现于第 {first} 个位置），名称必须唯一",
+                        ),
+                        "loc": ("placements", idx, "name"),
+                    }
+                )
+            else:
+                seen[placement.name] = idx
+
+        # 平移后的车辆顶点坐标不得越过既有范围（±1,000,000 毫米）；
+        # 每个位置每个方向只报首个越界顶点，避免错误噪音
+        vertices = [(p.x, p.y) for p in self.vehicle_polygon.points]
+        for idx, placement in enumerate(self.placements):
+            x_reported = y_reported = False
+            for k, (vx, vy) in enumerate(vertices):
+                if not x_reported and abs(vx + placement.dx) > COORD_LIMIT:
+                    errors.append(
+                        {
+                            "type": PydanticCustomError(
+                                "translated_coordinate_out_of_range",
+                                f"摆放位置 {placement.name} 平移后第 {k} 个顶点的 x 坐标为 "
+                                f"{vx + placement.dx}，绝对值不得超过 {COORD_LIMIT} 毫米",
+                            ),
+                            "loc": ("placements", idx, "dx"),
+                        }
+                    )
+                    x_reported = True
+                if not y_reported and abs(vy + placement.dy) > COORD_LIMIT:
+                    errors.append(
+                        {
+                            "type": PydanticCustomError(
+                                "translated_coordinate_out_of_range",
+                                f"摆放位置 {placement.name} 平移后第 {k} 个顶点的 y 坐标为 "
+                                f"{vy + placement.dy}，绝对值不得超过 {COORD_LIMIT} 毫米",
+                            ),
+                            "loc": ("placements", idx, "dy"),
+                        }
+                    )
+                    y_reported = True
+                if x_reported and y_reported:
+                    break
+
+        if errors:
+            raise ValidationError.from_exception_data(self.__class__.__name__, errors)
+        return self
+
+
 class PointOut(BaseModel):
     x: int
     y: int
@@ -196,3 +285,19 @@ class ClearanceResponse(BaseModel):
     required_clearance_mm: int
     intersects: bool = Field(..., description="两组线段是否相交或接触")
     dangerous_pair: DangerousPair
+
+
+class PlacementResult(ClearanceResponse):
+    """单个摆放位置的净距结论：既有结论结构附加位置名称。"""
+
+    name: str = Field(..., description="对应输入摆放位置的名称")
+
+
+class ClearanceSeriesResponse(BaseModel):
+    """批量复核结论：results 与输入 placements 按顺序一一对应。"""
+
+    results: list[PlacementResult]
+    all_passed: bool = Field(..., description="全部位置均通过时为 true")
+    first_failed_name: str | None = Field(
+        ..., description="首个不通过位置的名称；全部通过时为 null"
+    )

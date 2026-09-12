@@ -2,6 +2,7 @@
 
 纯后端 JSON API：输入**激光测量导出的隧道断面折线**与**车辆限界多边形**（坐标均为毫米整数），
 计算两组线段之间的全局最小欧氏距离，判定车辆限界是否满足指定净距，并定位**唯一的最危险线段对**。
+支持单点复核与**批量平移位置复核**（同一断面上一至五十个摆放位置一次核验）。
 全程不依赖 CAD 软件，也不依赖任何第三方几何库——线段相交、点到线段距离均为自行实现。
 
 - Python 3.12 · FastAPI · Pydantic v2
@@ -39,7 +40,8 @@ docker compose up --build
   ```
 
 - `verify` 是**一次性验收服务**：等待 `api` 健康检查通过后，对其执行端到端断言
-  （通过 / 不通过 / 相交 / 闭合边 / 四舍五入 / 字段级错误 / 自交多边形），
+  （通过 / 不通过 / 相交 / 闭合边 / 四舍五入 / 字段级错误 / 自交多边形 /
+  批量位置全过 / 首个失败不中断 / 平移越界定位 / 旧接口响应不变），
   打印 `[PASS]`/`[FAIL]` 后退出，退出码即验收结论（0 通过）。可单独运行：
 
   ```bash
@@ -57,7 +59,7 @@ docker compose up --build
 python3.12 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload
-pytest                 # 57 项测试
+pytest                 # 66 项测试
 BASE_URL=http://127.0.0.1:8000 python scripts/acceptance.py
 ```
 
@@ -157,6 +159,49 @@ curl -s http://localhost:8000/api/clearance/check \
 }
 ```
 
+### `POST /api/clearance/check-series`
+
+批量复核：同一隧道断面与车辆限界下，一次核验 **1~50 个摆放位置**。
+请求体在 `check` 的基础上增加 `placements` 列表，其余字段与校验规则完全相同：
+
+| 字段 | 说明 |
+| --- | --- |
+| `placements[].name` | 位置名称，非空字符串，**同一批次内唯一** |
+| `placements[].dx` / `placements[].dy` | 车辆限界整体的横/纵平移量（毫米，**整数**） |
+
+每个位置先把车辆顶点平移 `(dx, dy)`（隧道折线不动），再按与 `check` 完全相同的
+最小线段对算法、通过门槛、舍入与并列选边规则计算；危险边端点展示**平移后**的坐标。
+**单个位置不合格不会中断批次**，全部位置都会完成计算。
+
+响应按输入顺序给出每个位置的结论（`check` 的响应结构 + `name`）：
+
+```json
+{
+  "results": [
+    {
+      "name": "a",
+      "passed": true,
+      "minimum_clearance_mm": 200.0,
+      "required_clearance_mm": 150,
+      "intersects": false,
+      "dangerous_pair": { "tunnel_segment": {}, "vehicle_segment": {}, "distance_mm": 200.0 }
+    }
+  ],
+  "all_passed": true,
+  "first_failed_name": null
+}
+```
+
+- `all_passed`：全部位置均通过时为 `true`；
+- `first_failed_name`：首个不通过位置的名称；全部通过时为 `null`。
+
+批量特有的 `422` 校验（错误**定位到具体位置或偏移字段**）：
+
+- 名称重复：`duplicate_placement_name`，定位到 `placements.<下标>.name`（重复出现的后者）；
+- 列表为空 / 超过 50 个：`too_short` / `too_long`，定位到 `placements`；
+- 平移后任一车辆顶点坐标越过 ±1,000,000：`translated_coordinate_out_of_range`，
+  定位到 `placements.<下标>.dx` 或 `placements.<下标>.dy`。
+
 交互式文档：启动后访问 `http://localhost:8000/docs`。
 
 ## 几何规则与判定语义
@@ -183,4 +228,5 @@ pytest
 覆盖内容包括：普通交叉 / T 形 / 端点相接 / 共线重叠的相交判定，垂足在线段内外的
 点线距离，自交多边形（蝴蝶结、非相邻边接触）与凹多边形，并列 `1e-9` 阈值的两侧边界，
 闭合边成为最危险边，大坐标双精度，`ROUND_HALF_UP` 的 `.0005` 进位，
-未舍入门槛，以及全部字段级错误定位。
+未舍入门槛，全部字段级错误定位，以及批量位置复核（全过 / 首个失败不中断 /
+相交位置 / 平移越界与重名的字段级错误 / 数量边界 / 与单点接口结论一致）。

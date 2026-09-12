@@ -254,6 +254,237 @@ def main() -> int:
         types = {e["type"] for e in body["detail"]}
         check("case7 含 self_intersecting_polygon", "self_intersecting_polygon" in types, str(types))
 
+    # 8. 批量位置：全部通过，结果按输入顺序，危险边端点展示平移后坐标
+    status, body = post(
+        "/api/clearance/check-series",
+        {
+            "tunnel_polyline": {
+                "points": [
+                    {"x": 0, "y": 0},
+                    {"x": 0, "y": 1200},
+                    {"x": 1000, "y": 1200},
+                    {"x": 1000, "y": 0},
+                ]
+            },
+            "vehicle_polygon": {
+                "points": [
+                    {"x": 200, "y": 200},
+                    {"x": 800, "y": 200},
+                    {"x": 800, "y": 1000},
+                    {"x": 200, "y": 1000},
+                ]
+            },
+            "required_clearance": 150,
+            "placements": [
+                {"name": "a", "dx": 0, "dy": 0},
+                {"name": "b", "dx": 50, "dy": 0},
+                {"name": "c", "dx": 0, "dy": 50},
+            ],
+        },
+    )
+    check("case8 status 200", status == 200, str(body))
+    if status == 200:
+        check("case8 all_passed=true", body["all_passed"] is True)
+        check("case8 first_failed_name 为 null", body["first_failed_name"] is None)
+        check(
+            "case8 结果按输入顺序返回",
+            [r["name"] for r in body["results"]] == ["a", "b", "c"],
+            json.dumps(body.get("results"), ensure_ascii=False),
+        )
+        check(
+            "case8 各位置最小净距 200/150/150",
+            [r["minimum_clearance_mm"] for r in body["results"]] == [200.0, 150.0, 150.0],
+        )
+        check("case8 全部位置 passed=true", all(r["passed"] for r in body["results"]))
+        # b 右移 50mm：限界底边平移为 (250,200)->(850,200)，右下角距右壁 150mm
+        pair_b = body["results"][1]["dangerous_pair"]
+        check(
+            "case8 危险边端点为平移后坐标 (250,200)->(850,200)",
+            pair_b["vehicle_segment"]["start"] == {"x": 250, "y": 200}
+            and pair_b["vehicle_segment"]["end"] == {"x": 850, "y": 200}
+            and approx(pair_b["distance_mm"], 150.0),
+            json.dumps(pair_b, ensure_ascii=False),
+        )
+
+    # 9. 批量位置：中间位置不合格不中断批次，first_failed_name 指向首个失败
+    status, body = post(
+        "/api/clearance/check-series",
+        {
+            "tunnel_polyline": {
+                "points": [
+                    {"x": 0, "y": 0},
+                    {"x": 0, "y": 1200},
+                    {"x": 1000, "y": 1200},
+                    {"x": 1000, "y": 0},
+                ]
+            },
+            "vehicle_polygon": {
+                "points": [
+                    {"x": 200, "y": 200},
+                    {"x": 800, "y": 200},
+                    {"x": 800, "y": 1000},
+                    {"x": 200, "y": 1000},
+                ]
+            },
+            "required_clearance": 200,
+            "placements": [
+                {"name": "ok-1", "dx": 0, "dy": 0},
+                {"name": "bad", "dx": -50, "dy": 0},
+                {"name": "ok-2", "dx": 0, "dy": 0},
+            ],
+        },
+    )
+    check("case9 status 200", status == 200, str(body))
+    if status == 200:
+        check("case9 all_passed=false", body["all_passed"] is False)
+        check("case9 first_failed_name=bad", body["first_failed_name"] == "bad")
+        check(
+            "case9 通过标记 [true, false, true]",
+            [r["passed"] for r in body["results"]] == [True, False, True],
+        )
+        check(
+            "case9 失败位置净距 150.000",
+            approx(body["results"][1]["minimum_clearance_mm"], 150.0),
+        )
+        check(
+            "case9 失败之后的位置仍完成计算（净距 200.000）",
+            approx(body["results"][2]["minimum_clearance_mm"], 200.0),
+        )
+
+    # 10. 平移后坐标越界 -> 422，错误定位到对应位置的偏移字段
+    status, body = post(
+        "/api/clearance/check-series",
+        {
+            "tunnel_polyline": {
+                "points": [
+                    {"x": 0, "y": 0},
+                    {"x": 0, "y": 1200},
+                    {"x": 1000, "y": 1200},
+                    {"x": 1000, "y": 0},
+                ]
+            },
+            "vehicle_polygon": {
+                "points": [
+                    {"x": 200, "y": 200},
+                    {"x": 800, "y": 200},
+                    {"x": 800, "y": 1000},
+                    {"x": 200, "y": 1000},
+                ]
+            },
+            "required_clearance": 150,
+            "placements": [
+                {"name": "ok", "dx": 0, "dy": 0},
+                {"name": "far", "dx": 999_201, "dy": 0},
+            ],
+        },
+    )
+    check("case10 status 422（平移后越界）", status == 422, str(body))
+    if status == 422:
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        joined = " | ".join(locs)
+        check("case10 定位到 placements.1.dx", "placements -> 1 -> dx" in joined, joined)
+        types = {e["type"] for e in body["detail"]}
+        check(
+            "case10 含 translated_coordinate_out_of_range",
+            "translated_coordinate_out_of_range" in types,
+            str(types),
+        )
+
+    # 11. 名称重复 / 空列表 / 超 50 个 -> 422
+    dup_payload = {
+        "tunnel_polyline": {"points": [{"x": 0, "y": 0}, {"x": 1000, "y": 0}]},
+        "vehicle_polygon": {
+            "points": [
+                {"x": 200, "y": 200},
+                {"x": 800, "y": 200},
+                {"x": 800, "y": 1000},
+                {"x": 200, "y": 1000},
+            ]
+        },
+        "required_clearance": 100,
+        "placements": [
+            {"name": "a", "dx": 0, "dy": 0},
+            {"name": "b", "dx": 1, "dy": 1},
+            {"name": "a", "dx": 2, "dy": 2},
+        ],
+    }
+    status, body = post("/api/clearance/check-series", dup_payload)
+    check("case11a status 422（名称重复）", status == 422, str(body))
+    if status == 422:
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        joined = " | ".join(locs)
+        check("case11a 定位到 placements.2.name", "placements -> 2 -> name" in joined, joined)
+        types = {e["type"] for e in body["detail"]}
+        check("case11a 含 duplicate_placement_name", "duplicate_placement_name" in types, str(types))
+
+    status, body = post("/api/clearance/check-series", {**dup_payload, "placements": []})
+    check("case11b status 422（空列表）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        check("case11b 含 too_short", "too_short" in types, str(types))
+
+    status, body = post(
+        "/api/clearance/check-series",
+        {
+            **dup_payload,
+            "placements": [{"name": f"p{i}", "dx": 0, "dy": 0} for i in range(51)],
+        },
+    )
+    check("case11c status 422（超过 50 个位置）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        check("case11c 含 too_long", "too_long" in types, str(types))
+
+    # 12. 旧接口典型请求响应保持不变（精确匹配完整响应体）
+    status, body = post(
+        "/api/clearance/check",
+        {
+            "tunnel_polyline": {
+                "points": [
+                    {"x": 0, "y": 0},
+                    {"x": 0, "y": 1200},
+                    {"x": 1000, "y": 1200},
+                    {"x": 1000, "y": 0},
+                ]
+            },
+            "vehicle_polygon": {
+                "points": [
+                    {"x": 200, "y": 200},
+                    {"x": 800, "y": 200},
+                    {"x": 800, "y": 1000},
+                    {"x": 200, "y": 1000},
+                ]
+            },
+            "required_clearance": 200,
+        },
+    )
+    check("case12 status 200", status == 200, str(body))
+    if status == 200:
+        check(
+            "case12 旧接口响应体逐字段不变",
+            body
+            == {
+                "passed": True,
+                "minimum_clearance_mm": 200.0,
+                "required_clearance_mm": 200,
+                "intersects": False,
+                "dangerous_pair": {
+                    "tunnel_segment": {
+                        "start_index": 0,
+                        "start": {"x": 0, "y": 0},
+                        "end": {"x": 0, "y": 1200},
+                    },
+                    "vehicle_segment": {
+                        "start_index": 0,
+                        "start": {"x": 200, "y": 200},
+                        "end": {"x": 800, "y": 200},
+                    },
+                    "distance_mm": 200.0,
+                },
+            },
+            json.dumps(body, ensure_ascii=False),
+        )
+
     print()
     if failures:
         print(f"验收失败：{len(failures)} 项")

@@ -473,3 +473,240 @@ def test_open_tunnel_is_not_closed():
     assert body["intersects"] is False
     # 最近距离是到基角 (0,0)/(1000,0) 的距离，远大于 50
     assert body["minimum_clearance_mm"] > 400.0
+
+
+def test_check_endpoint_response_unchanged():
+    # 旧接口典型请求的完整响应体精确不变
+    resp = post(
+        {
+            "tunnel_polyline": ARCH_TUNNEL,
+            "vehicle_polygon": RECT_VEHICLE,
+            "required_clearance": 200,
+        }
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "passed": True,
+        "minimum_clearance_mm": 200.0,
+        "required_clearance_mm": 200,
+        "intersects": False,
+        "dangerous_pair": {
+            "tunnel_segment": {
+                "start_index": 0,
+                "start": {"x": 0, "y": 0},
+                "end": {"x": 0, "y": 1200},
+            },
+            "vehicle_segment": {
+                "start_index": 0,
+                "start": {"x": 200, "y": 200},
+                "end": {"x": 800, "y": 200},
+            },
+            "distance_mm": 200.0,
+        },
+    }
+
+
+# ---------- 批量摆放位置复核 /api/clearance/check-series ----------
+
+def post_series(payload):
+    return client.post("/api/clearance/check-series", json=payload)
+
+
+def series_payload(placements, required=150):
+    return {
+        "tunnel_polyline": ARCH_TUNNEL,
+        "vehicle_polygon": RECT_VEHICLE,
+        "required_clearance": required,
+        "placements": placements,
+    }
+
+
+def test_series_all_positions_pass_in_order():
+    resp = post_series(
+        series_payload(
+            [
+                {"name": "a", "dx": 0, "dy": 0},
+                {"name": "b", "dx": 50, "dy": 0},
+                {"name": "c", "dx": 0, "dy": 50},
+            ],
+            required=150,
+        )
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["all_passed"] is True
+    assert body["first_failed_name"] is None
+    # 结果与输入顺序一一对应
+    assert [r["name"] for r in body["results"]] == ["a", "b", "c"]
+    assert [r["minimum_clearance_mm"] for r in body["results"]] == [200.0, 150.0, 150.0]
+    assert all(r["passed"] for r in body["results"])
+    assert all(r["required_clearance_mm"] == 150 for r in body["results"])
+    # 危险边端点展示平移后的坐标：b 右移 50mm 后，限界右下角 (850,200) 距
+    # 隧道右壁 150mm；并列 150mm 中按 (隧道索引, 限界索引) 取限界边0
+    pair_b = body["results"][1]["dangerous_pair"]
+    assert pair_b["tunnel_segment"]["start_index"] == 2
+    assert pair_b["vehicle_segment"]["start_index"] == 0
+    assert pair_b["vehicle_segment"]["start"] == {"x": 250, "y": 200}
+    assert pair_b["vehicle_segment"]["end"] == {"x": 850, "y": 200}
+    assert pair_b["distance_mm"] == 150.0
+
+
+def test_series_first_failure_does_not_interrupt():
+    resp = post_series(
+        series_payload(
+            [
+                {"name": "ok-1", "dx": 0, "dy": 0},
+                {"name": "bad", "dx": -50, "dy": 0},
+                {"name": "ok-2", "dx": 0, "dy": 0},
+            ],
+            required=200,
+        )
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["all_passed"] is False
+    assert body["first_failed_name"] == "bad"
+    assert [r["passed"] for r in body["results"]] == [True, False, True]
+    assert body["results"][1]["minimum_clearance_mm"] == 150.0
+    # 首个失败之后的位置仍完成计算
+    assert body["results"][2]["minimum_clearance_mm"] == 200.0
+
+
+def test_series_intersecting_placement_fails_but_batch_completes():
+    # dx=-200 后限界左边与隧道左壁共线重叠（相交/接触），距离为 0
+    resp = post_series(
+        series_payload(
+            [
+                {"name": "touch", "dx": -200, "dy": 0},
+                {"name": "ok", "dx": 0, "dy": 0},
+            ],
+            required=0,
+        )
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["all_passed"] is False
+    assert body["first_failed_name"] == "touch"
+    first, second = body["results"]
+    assert first["intersects"] is True
+    assert first["passed"] is False
+    assert first["minimum_clearance_mm"] == 0.0
+    assert second["passed"] is True
+    assert second["intersects"] is False
+
+
+def test_series_matches_single_check_for_zero_offset():
+    single = post(
+        {
+            "tunnel_polyline": ARCH_TUNNEL,
+            "vehicle_polygon": RECT_VEHICLE,
+            "required_clearance": 200,
+        }
+    ).json()
+    resp = post_series(series_payload([{"name": "same", "dx": 0, "dy": 0}], required=200))
+    assert resp.status_code == 200
+    body = resp.json()
+    # 零偏移位置的结论结构与单点接口完全一致（仅多一个名称字段）
+    assert body["results"] == [{"name": "same", **single}]
+    assert body["all_passed"] is True
+    assert body["first_failed_name"] is None
+
+
+def test_series_translated_coordinate_out_of_range():
+    # 车辆最大 x 为 800，dx=999201 使平移后 x = 1,000,001 越界
+    resp = post_series(
+        series_payload(
+            [
+                {"name": "ok", "dx": 0, "dy": 0},
+                {"name": "far", "dx": 999_201, "dy": 0},
+            ]
+        )
+    )
+    assert resp.status_code == 422
+    locs = _locs(resp)
+    assert "body -> placements -> 1 -> dx" in locs
+    types = {e["type"] for e in resp.json()["detail"]}
+    assert "translated_coordinate_out_of_range" in types
+
+    # y 方向越界定位到 dy（车辆最小 y 为 200，dy=-1000201 使 y = -1,000,001）
+    resp2 = post_series(series_payload([{"name": "far", "dx": 0, "dy": -1_000_201}]))
+    assert resp2.status_code == 422
+    assert "body -> placements -> 0 -> dy" in _locs(resp2)
+
+    # 恰好平移到边界 ±1,000,000 是合法的
+    resp3 = post_series(series_payload([{"name": "edge", "dx": 999_200, "dy": 0}]))
+    assert resp3.status_code == 200
+
+
+def test_series_duplicate_names_rejected():
+    resp = post_series(
+        series_payload(
+            [
+                {"name": "a", "dx": 0, "dy": 0},
+                {"name": "b", "dx": 1, "dy": 1},
+                {"name": "a", "dx": 2, "dy": 2},
+            ]
+        )
+    )
+    assert resp.status_code == 422
+    locs = _locs(resp)
+    assert "body -> placements -> 2 -> name" in locs
+    types = {e["type"] for e in resp.json()["detail"]}
+    assert "duplicate_placement_name" in types
+
+
+def test_series_placements_count_bounds():
+    # 空列表
+    resp = post_series(series_payload([]))
+    assert resp.status_code == 422
+    assert any(e["type"] == "too_short" for e in resp.json()["detail"])
+
+    # 超过 50 个
+    resp = post_series(
+        series_payload([{"name": f"p{i}", "dx": 0, "dy": 0} for i in range(51)])
+    )
+    assert resp.status_code == 422
+    assert any(e["type"] == "too_long" for e in resp.json()["detail"])
+
+    # 恰好 50 个合法
+    resp = post_series(
+        series_payload([{"name": f"p{i}", "dx": 0, "dy": 0} for i in range(50)])
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["results"]) == 50
+    assert body["all_passed"] is True
+
+
+def test_series_placement_field_types():
+    # dx/dy 必须是整数
+    resp = post_series(series_payload([{"name": "a", "dx": 1.5, "dy": 0}]))
+    assert resp.status_code == 422
+    assert "body -> placements -> 0 -> dx" in _locs(resp)
+
+    # 布尔值不得冒充整数
+    resp = post_series(series_payload([{"name": "a", "dx": True, "dy": 0}]))
+    assert resp.status_code == 422
+
+    # 名称不能为空
+    resp = post_series(series_payload([{"name": "", "dx": 0, "dy": 0}]))
+    assert resp.status_code == 422
+
+    # 禁止多余字段
+    resp = post_series(series_payload([{"name": "a", "dx": 0, "dy": 0, "dz": 1}]))
+    assert resp.status_code == 422
+    assert any(e["type"] == "extra_forbidden" for e in resp.json()["detail"])
+
+    # 缺少 placements 字段
+    resp = post_series(
+        {
+            "tunnel_polyline": ARCH_TUNNEL,
+            "vehicle_polygon": RECT_VEHICLE,
+            "required_clearance": 150,
+        }
+    )
+    assert resp.status_code == 422
+    assert any(
+        e["type"] == "missing" and e["loc"][-1] == "placements"
+        for e in resp.json()["detail"]
+    )

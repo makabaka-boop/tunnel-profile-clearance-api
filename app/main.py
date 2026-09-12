@@ -5,12 +5,21 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from .geometry import minimum_segment_pair, round_three
-from .schemas import ClearanceRequest, ClearanceResponse, DangerousPair, PointOut, SegmentRef
+from .schemas import (
+    ClearanceRequest,
+    ClearanceResponse,
+    ClearanceSeriesRequest,
+    ClearanceSeriesResponse,
+    DangerousPair,
+    PlacementResult,
+    PointOut,
+    SegmentRef,
+)
 
 app = FastAPI(
     title="隧道限界复核 API",
-    version="1.0.0",
-    description="纯后端 JSON API：计算隧道折线与车辆限界多边形之间的全局最小净距。",
+    version="1.1.0",
+    description="纯后端 JSON API：计算隧道折线与车辆限界多边形之间的全局最小净距，支持单点与批量平移位置复核。",
 )
 
 
@@ -24,26 +33,18 @@ def _segment_ref(points, index: int, *, closed: bool) -> SegmentRef:
     )
 
 
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok"}
+def _conclusion(tunnel_points, vehicle_points, required: int) -> ClearanceResponse:
+    """对一组顶点计算净距结论（vehicle_points 为已施加平移后的坐标）。
 
+    未舍入的双精度最小距离 + 按规则选出的唯一线段对；
+    通过条件：未相交/接触，且未舍入最小距离 >= 要求净距。
+    """
+    tunnel = [(float(x), float(y)) for x, y in tunnel_points]
+    vehicle = [(float(x), float(y)) for x, y in vehicle_points]
 
-@app.post("/api/clearance/check", response_model=ClearanceResponse)
-def check_clearance(req: ClearanceRequest) -> ClearanceResponse:
-    tunnel = [(float(p.x), float(p.y)) for p in req.tunnel_polyline.points]
-    vehicle = [(float(p.x), float(p.y)) for p in req.vehicle_polygon.points]
-
-    # 未舍入的双精度最小距离 + 按规则选出的唯一线段对
     distance, ti, vi = minimum_segment_pair(tunnel, vehicle)
     intersects = distance == 0.0
-
-    required = req.required_clearance
-    # 通过条件：未相交/接触，且未舍入最小距离 >= 要求净距
     passed = (not intersects) and distance >= float(required)
-
-    tunnel_points = [(p.x, p.y) for p in req.tunnel_polyline.points]
-    vehicle_points = [(p.x, p.y) for p in req.vehicle_polygon.points]
 
     return ClearanceResponse(
         passed=passed,
@@ -55,4 +56,39 @@ def check_clearance(req: ClearanceRequest) -> ClearanceResponse:
             vehicle_segment=_segment_ref(vehicle_points, vi, closed=True),
             distance_mm=round_three(distance),
         ),
+    )
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.post("/api/clearance/check", response_model=ClearanceResponse)
+def check_clearance(req: ClearanceRequest) -> ClearanceResponse:
+    tunnel_points = [(p.x, p.y) for p in req.tunnel_polyline.points]
+    vehicle_points = [(p.x, p.y) for p in req.vehicle_polygon.points]
+    return _conclusion(tunnel_points, vehicle_points, req.required_clearance)
+
+
+@app.post("/api/clearance/check-series", response_model=ClearanceSeriesResponse)
+def check_clearance_series(req: ClearanceSeriesRequest) -> ClearanceSeriesResponse:
+    tunnel_points = [(p.x, p.y) for p in req.tunnel_polyline.points]
+    base_vehicle = [(p.x, p.y) for p in req.vehicle_polygon.points]
+
+    results: list[PlacementResult] = []
+    first_failed_name: str | None = None
+    for placement in req.placements:
+        # 车辆顶点整体平移 (dx, dy)，隧道折线不动；危险边端点展示平移后坐标
+        shifted = [(x + placement.dx, y + placement.dy) for x, y in base_vehicle]
+        conclusion = _conclusion(tunnel_points, shifted, req.required_clearance)
+        results.append(PlacementResult(name=placement.name, **conclusion.model_dump()))
+        # 单个位置不合格不中断批次，仅记录首个失败名称
+        if not conclusion.passed and first_failed_name is None:
+            first_failed_name = placement.name
+
+    return ClearanceSeriesResponse(
+        results=results,
+        all_passed=all(item.passed for item in results),
+        first_failed_name=first_failed_name,
     )
