@@ -1,5 +1,6 @@
 services:
   api:
+    # 唯一负责构建并打标签的服务
     build: .
     image: tunnel-clearance-api:latest
     ports:
@@ -12,10 +13,11 @@ services:
       retries: 15
       start_period: 3s
 
-  # 一次性验收服务：等待 api 健康后执行端到端断言，退出码即验收结论
+  # 一次性验收服务：复用 api 构建出的镜像（自己不构建，避免同名标签争用），
+  # 等待 api 健康后执行端到端断言，退出码即验收结论
   verify:
-    build: .
     image: tunnel-clearance-api:latest
+    pull_policy: never
     depends_on:
       api:
         condition: service_healthy

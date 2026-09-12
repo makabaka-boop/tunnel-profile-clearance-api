@@ -47,6 +47,10 @@ docker compose up --build
   docker compose run --rm verify
   ```
 
+  镜像只由 `api` 服务构建一次（`verify` 不配置 `build`，避免并发构建争抢同名标签）；
+  `verify` 以 `pull_policy: never` 强制复用本地镜像，因此单独运行前必须先执行
+  `docker compose build`（`up --build` 会自动先构建）。
+
 ### 本地开发
 
 ```bash
