@@ -1,0 +1,25 @@
+services:
+  api:
+    build: .
+    image: tunnel-clearance-api:latest
+    ports:
+      # 宿主端口由 API_PORT 覆盖；容器内固定监听 8000
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
+
+  # 一次性验收服务：等待 api 健康后执行端到端断言，退出码即验收结论
+  verify:
+    build: .
+    image: tunnel-clearance-api:latest
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://api:8000
+    command: ["python", "scripts/acceptance.py"]
+    restart: "no"
