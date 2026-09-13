@@ -3,6 +3,7 @@
 纯后端 JSON API：输入**激光测量导出的隧道断面折线**与**车辆限界多边形**（坐标均为毫米整数），
 计算两组线段之间的全局最小欧氏距离，判定车辆限界是否满足指定净距，并定位**唯一的最危险线段对**。
 支持单点复核与**批量平移位置复核**（同一断面上一至五十个摆放位置一次核验）。
+另支持**同一断面两期测点比对**：以共同基准点排除仪器整体平移后，逐点计算位移并判定是否超过容差。
 全程不依赖 CAD 软件，也不依赖任何第三方几何库——线段相交、点到线段距离均为自行实现。
 
 - Python 3.12 · FastAPI · Pydantic v2
@@ -14,6 +15,7 @@
 ```
 app/
   geometry.py     # 线段相交 / 点到线段距离 / 两组线段全局最小距离（纯 Python）
+  comparison.py   # 两期测点比对：基准点对齐 + 逐点位移与容差判定（纯 Python）
   schemas.py      # Pydantic 模型与字段级几何校验
   main.py         # FastAPI 入口
 scripts/
@@ -41,7 +43,8 @@ docker compose up --build
 
 - `verify` 是**一次性验收服务**：等待 `api` 健康检查通过后，对其执行端到端断言
   （通过 / 不通过 / 相交 / 闭合边 / 四舍五入 / 字段级错误 / 自交多边形 /
-  批量位置全过 / 首个失败不中断 / 平移越界定位 / 旧接口响应不变），
+  批量位置全过 / 首个失败不中断 / 平移越界定位 / 旧接口响应不变 /
+  断面比对纯平移全过 / 单点位移定位 / 并列选择稳定 / 名称不匹配拒绝），
   打印 `[PASS]`/`[FAIL]` 后退出，退出码即验收结论（0 通过）。可单独运行：
 
   ```bash
@@ -59,7 +62,7 @@ docker compose up --build
 python3.12 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload
-pytest                 # 71 项测试
+pytest                 # 88 项测试
 BASE_URL=http://127.0.0.1:8000 python scripts/acceptance.py
 ```
 
@@ -205,6 +208,81 @@ curl -s http://localhost:8000/api/clearance/check \
 - 平移后任一车辆顶点坐标越过 ±1,000,000：`translated_coordinate_out_of_range`，
   定位到 `placements.<下标>.dx` 或 `placements.<下标>.dy`。
 
+### `POST /api/profiles/compare`
+
+断面变化比对：输入同一断面的**基准测点**与**本期测点**两组数据，先以共同基准点的
+坐标差平移全部本期测点（排除仪器整体平移），再逐点计算与同名基准测点的欧氏位移，
+形成可保存的断面变化报告。
+
+请求体（坐标为**毫米整数**，绝对值不超过 1,000,000）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `baseline_points` | 基准测点列表（至少 1 个），每项 `{"name": <str>, "x": <int>, "y": <int>}`，名称组内唯一 |
+| `current_points` | 本期测点列表，名称与顺序须与 `baseline_points` **完全一致** |
+| `reference_point` | 两组中共同存在的基准点名称，用于对齐整体平移 |
+| `tolerance` | 位移容差（毫米，**非负整数**）；未舍入位移 `<=` 容差判为合格 |
+
+```bash
+curl -s http://localhost:8000/api/profiles/compare \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "baseline_points": [
+      {"name": "L1", "x": 0,   "y": 0},
+      {"name": "C1", "x": 500, "y": 1500},
+      {"name": "R1", "x": 1000, "y": 0}
+    ],
+    "current_points": [
+      {"name": "L1", "x": -7,  "y": 11},
+      {"name": "C1", "x": 496, "y": 1515},
+      {"name": "R1", "x": 993, "y": 11}
+    ],
+    "reference_point": "L1",
+    "tolerance": 4
+  }'
+```
+
+响应（修正量 `(7, -11)`，C1 修正后 `(503, 1504)`、位移 5mm 超限）：
+
+```json
+{
+  "correction": {"dx": 7, "dy": -11},
+  "points": [
+    {"name": "L1", "x": 0, "y": 0, "displacement_mm": 0.0},
+    {"name": "C1", "x": 503, "y": 1504, "displacement_mm": 5.0},
+    {"name": "R1", "x": 1000, "y": 0, "displacement_mm": 0.0}
+  ],
+  "max_displacement_name": "C1",
+  "max_displacement_mm": 5.0,
+  "exceeded_names": ["C1"],
+  "all_passed": false
+}
+```
+
+字段说明：
+
+- `correction`：对齐修正量，等于基准组基准点坐标减去本期组基准点坐标；
+- `points`：逐点**修正后坐标**与位移，顺序与输入本期测点一致；位移保留三位小数；
+- `max_displacement_name` / `max_displacement_mm`：位移最大的测点及其位移；
+  **并列时取输入顺序靠前者**；
+- `exceeded_names`：位移超过容差的测点名称，按输入顺序排列；
+- `all_passed`：全部测点均未超限时为 `true`。
+
+判定语义与净距接口一致：容差比较使用**未舍入**的双精度位移（位移恰好等于容差判合格），
+只有输出字段四舍五入到三位小数。因此可能出现位移显示 `2000.0` 但容差 2000mm
+仍判超限的情况。
+
+比对特有的 `422` 校验（**任何校验失败都不生成部分报告**，错误定位到具体列表项或字段）：
+
+- 两组名称顺序不一致：`point_name_mismatch`，定位到 `current_points.<下标>.name`（首个分歧处）；
+- 两组数量不一致：`point_count_mismatch`，定位到 `current_points`；
+- 组内名称重复：`duplicate_point_name`，定位到对应组的 `.<下标>.name`（重复出现的后者）；
+- 基准点缺失：`reference_point_missing`，定位到 `reference_point`；
+- 容差为负：`greater_than_equal`，定位到 `tolerance`；
+- 修正后坐标越过 ±1,000,000：`corrected_coordinate_out_of_range`，
+  定位到 `current_points.<下标>.x` 或 `.<下标>.y`；
+- 测点名称仅含空白字符：`blank_point_name`；坐标非整数 / 越界、多余字段等同既有规则。
+
 交互式文档：启动后访问 `http://localhost:8000/docs`。
 
 ## 几何规则与判定语义
@@ -233,6 +311,8 @@ pytest
 覆盖内容包括：普通交叉 / T 形 / 端点相接 / 共线重叠的相交判定，垂足在线段内外的
 点线距离，自交多边形（蝴蝶结、非相邻边接触）与凹多边形，并列 `1e-9` 阈值的两侧边界，
 闭合边成为最危险边，零面积共线轮廓拒绝，大坐标双精度，`ROUND_HALF_UP` 的 `.0005` 进位，
-未舍入门槛，全部字段级错误定位，以及批量位置复核（全过 / 首个失败不中断 /
+未舍入门槛，全部字段级错误定位，批量位置复核（全过 / 首个失败不中断 /
 相交位置 / 空白名称 / 平移越界与重名的字段级错误 / 重名与偏移错误同时返回 /
-数量边界 / 与单点接口结论一致）。
+数量边界 / 与单点接口结论一致），以及断面两期比对（纯整体平移全过 / 单点真实位移定位 /
+最大位移并列取输入顺序靠前者 / 未舍入容差门槛 / 名称顺序与数量不一致拒绝 /
+组内重名 / 基准点缺失 / 负容差 / 修正后坐标越界 / 测点字段级错误）。

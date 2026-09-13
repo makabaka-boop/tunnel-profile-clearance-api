@@ -761,3 +761,323 @@ def test_series_placement_field_types():
         e["type"] == "missing" and e["loc"][-1] == "placements"
         for e in resp.json()["detail"]
     )
+
+
+# ---------- 断面两期比对 /api/profiles/compare ----------
+
+BASELINE_SECTION = [
+    {"name": "L1", "x": 0, "y": 0},
+    {"name": "L2", "x": 0, "y": 1200},
+    {"name": "C1", "x": 500, "y": 1500},
+    {"name": "R2", "x": 1000, "y": 1200},
+    {"name": "R1", "x": 1000, "y": 0},
+]
+
+
+def post_compare(payload):
+    return client.post("/api/profiles/compare", json=payload)
+
+
+def compare_payload(current, reference="C1", tolerance=5, baseline=None):
+    return {
+        "baseline_points": baseline if baseline is not None else BASELINE_SECTION,
+        "current_points": current,
+        "reference_point": reference,
+        "tolerance": tolerance,
+    }
+
+
+def test_compare_pure_translation_all_pass():
+    # 仪器整体平移 (-7, +11)：修正后应与基准完全重合，全部合格
+    current = [
+        {"name": "L1", "x": -7, "y": 11},
+        {"name": "L2", "x": -7, "y": 1211},
+        {"name": "C1", "x": 493, "y": 1511},
+        {"name": "R2", "x": 993, "y": 1211},
+        {"name": "R1", "x": 993, "y": 11},
+    ]
+    resp = post_compare(compare_payload(current, tolerance=3))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["correction"] == {"dx": 7, "dy": -11}
+    assert body["all_passed"] is True
+    assert body["exceeded_names"] == []
+    assert body["max_displacement_mm"] == 0.0
+    # 全部并列 0，最大位移取输入顺序最前者
+    assert body["max_displacement_name"] == "L1"
+    # 修正后坐标与基准一致，逐点顺序与输入一致
+    assert [(p["name"], p["x"], p["y"]) for p in body["points"]] == [
+        (p["name"], p["x"], p["y"]) for p in BASELINE_SECTION
+    ]
+    assert all(p["displacement_mm"] == 0.0 for p in body["points"])
+
+
+def test_compare_single_real_displacement_located():
+    # 整体平移 (-7, +11) 之外，C1 另有真实位移 (+3, +4) -> 5mm；
+    # 基准点取纯平移的 L1，修正量不被真实位移污染
+    current = [
+        {"name": "L1", "x": -7, "y": 11},
+        {"name": "L2", "x": -7, "y": 1211},
+        {"name": "C1", "x": 496, "y": 1515},
+        {"name": "R2", "x": 993, "y": 1211},
+        {"name": "R1", "x": 993, "y": 11},
+    ]
+    resp = post_compare(compare_payload(current, reference="L1", tolerance=5))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["correction"] == {"dx": 7, "dy": -11}
+    # 位移恰好等于容差，判合格
+    assert body["all_passed"] is True
+    assert body["exceeded_names"] == []
+    assert body["max_displacement_name"] == "C1"
+    assert body["max_displacement_mm"] == 5.0
+    c1 = next(p for p in body["points"] if p["name"] == "C1")
+    assert (c1["x"], c1["y"]) == (503, 1504)
+    assert c1["displacement_mm"] == 5.0
+
+    # 容差收紧到 4mm 时唯一位移点 C1 被定位
+    resp2 = post_compare(compare_payload(current, reference="L1", tolerance=4))
+    body2 = resp2.json()
+    assert body2["all_passed"] is False
+    assert body2["exceeded_names"] == ["C1"]
+    assert body2["max_displacement_name"] == "C1"
+    assert body2["max_displacement_mm"] == 5.0
+
+
+def test_compare_max_tie_prefers_earlier_input():
+    baseline = [
+        {"name": "A", "x": 0, "y": 0},
+        {"name": "B", "x": 100, "y": 0},
+        {"name": "C", "x": 200, "y": 0},
+    ]
+    # B 位移 hypot(6,8)=10，C 位移 hypot(-8,6)=10，并列取输入顺序靠前的 B
+    current = [
+        {"name": "A", "x": 0, "y": 0},
+        {"name": "B", "x": 106, "y": 8},
+        {"name": "C", "x": 192, "y": 6},
+    ]
+    resp = post_compare(compare_payload(current, reference="A", tolerance=20, baseline=baseline))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["max_displacement_mm"] == 10.0
+    assert body["max_displacement_name"] == "B"
+
+    # 交换 B/C 输入顺序后，同一对并列位移的最大测点变为 C
+    resp2 = post_compare(
+        compare_payload(
+            [current[0], current[2], current[1]],
+            reference="A",
+            tolerance=20,
+            baseline=[baseline[0], baseline[2], baseline[1]],
+        )
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["max_displacement_name"] == "C"
+
+
+def test_compare_displacement_rounding_and_unrounded_gate():
+    baseline = [
+        {"name": "REF", "x": 0, "y": 0},
+        {"name": "D", "x": 0, "y": 0},
+    ]
+    # 位移 sqrt(2) ≈ 1.41421356：输出 1.414，容差 1 按未舍入值判超限
+    current = [
+        {"name": "REF", "x": 0, "y": 0},
+        {"name": "D", "x": 1, "y": 1},
+    ]
+    resp = post_compare(compare_payload(current, reference="REF", tolerance=1, baseline=baseline))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["points"][1]["displacement_mm"] == 1.414
+    assert body["max_displacement_mm"] == 1.414
+    assert body["exceeded_names"] == ["D"]
+    assert body["all_passed"] is False
+
+    # 未舍入门槛：位移 sqrt(2000^2+1) ≈ 2000.00025，显示 2000.0 但超过容差 2000
+    current2 = [
+        {"name": "REF", "x": 0, "y": 0},
+        {"name": "D", "x": 2000, "y": 1},
+    ]
+    resp2 = post_compare(compare_payload(current2, reference="REF", tolerance=2000, baseline=baseline))
+    body2 = resp2.json()
+    assert body2["points"][1]["displacement_mm"] == 2000.0
+    assert body2["all_passed"] is False
+    assert body2["exceeded_names"] == ["D"]
+
+    # 同一几何容差 2001 时合格，证明门槛比较基于未舍入值
+    resp3 = post_compare(compare_payload(current2, reference="REF", tolerance=2001, baseline=baseline))
+    assert resp3.json()["all_passed"] is True
+
+
+def test_compare_name_mismatch_rejected():
+    # 顺序不一致：定位到首个分歧的列表项
+    current = [
+        {"name": "L2", "x": 0, "y": 1200},
+        {"name": "L1", "x": 0, "y": 0},
+        {"name": "C1", "x": 500, "y": 1500},
+        {"name": "R2", "x": 1000, "y": 1200},
+        {"name": "R1", "x": 1000, "y": 0},
+    ]
+    resp = post_compare(compare_payload(current))
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert any(e["type"] == "point_name_mismatch" for e in detail)
+    assert "body -> current_points -> 0 -> name" in _locs(resp)
+    # 不生成部分报告
+    assert "points" not in resp.json()
+
+    # 数量不一致
+    resp2 = post_compare(compare_payload(BASELINE_SECTION[:4]))
+    assert resp2.status_code == 422
+    detail2 = resp2.json()["detail"]
+    assert any(e["type"] == "point_count_mismatch" for e in detail2)
+    assert "body -> current_points" in _locs(resp2)
+    assert "points" not in resp2.json()
+
+
+def test_compare_duplicate_names_rejected():
+    # 本期组内重名（同时也与基准顺序不一致，两类错误一并返回）
+    current = [
+        {"name": "L1", "x": 0, "y": 0},
+        {"name": "L2", "x": 0, "y": 1200},
+        {"name": "C1", "x": 500, "y": 1500},
+        {"name": "C1", "x": 1000, "y": 1200},
+        {"name": "R1", "x": 1000, "y": 0},
+    ]
+    resp = post_compare(compare_payload(current))
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert any(e["type"] == "duplicate_point_name" for e in detail)
+    assert "body -> current_points -> 3 -> name" in _locs(resp)
+
+    # 基准组内重名
+    baseline = [dict(p) for p in BASELINE_SECTION]
+    baseline[4] = {"name": "R2", "x": 1000, "y": 0}
+    current2 = [dict(p) for p in baseline]
+    resp2 = post_compare(compare_payload(current2, baseline=baseline))
+    assert resp2.status_code == 422
+    assert "body -> baseline_points -> 4 -> name" in _locs(resp2)
+
+
+def test_compare_reference_point_missing():
+    # 两组均不存在
+    resp = post_compare(compare_payload(BASELINE_SECTION, reference="NOPE"))
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert any(e["type"] == "reference_point_missing" for e in detail)
+    assert "body -> reference_point" in _locs(resp)
+
+    # 仅基准组缺失（名称不一致与基准点缺失一并报告）
+    baseline = [dict(p) for p in BASELINE_SECTION]
+    baseline[2] = {"name": "C2", "x": 500, "y": 1500}
+    resp2 = post_compare(compare_payload(BASELINE_SECTION, baseline=baseline))
+    assert resp2.status_code == 422
+    detail2 = resp2.json()["detail"]
+    types2 = {e["type"] for e in detail2}
+    assert "reference_point_missing" in types2
+    assert "point_name_mismatch" in types2
+
+
+def test_compare_negative_tolerance_rejected():
+    resp = post_compare(compare_payload(BASELINE_SECTION, tolerance=-1))
+    assert resp.status_code == 422
+    assert any(e["loc"][-1] == "tolerance" for e in resp.json()["detail"])
+
+    # 容差 0 合法：完全无位移时合格
+    resp2 = post_compare(compare_payload(BASELINE_SECTION, tolerance=0))
+    assert resp2.status_code == 200
+    assert resp2.json()["all_passed"] is True
+
+    # 容差必须是整数，布尔值不得冒充整数
+    assert post_compare(compare_payload(BASELINE_SECTION, tolerance=1.5)).status_code == 422
+    assert post_compare(compare_payload(BASELINE_SECTION, tolerance=True)).status_code == 422
+
+
+def test_compare_corrected_coordinate_out_of_range():
+    baseline = [
+        {"name": "REF", "x": 0, "y": 0},
+        {"name": "P1", "x": 999_000, "y": 0},
+    ]
+    # 修正量 (+2000, 0)：P1 修正后 x = 1,000,000 恰好合法
+    current = [
+        {"name": "REF", "x": -2000, "y": 0},
+        {"name": "P1", "x": 998_000, "y": 0},
+    ]
+    resp = post_compare(compare_payload(current, reference="REF", tolerance=3000, baseline=baseline))
+    assert resp.status_code == 200
+
+    # x 方向越界：P1 修正后 x = 1,000,001，定位到对应列表项的 x
+    current2 = [
+        {"name": "REF", "x": -2000, "y": 0},
+        {"name": "P1", "x": 998_001, "y": 0},
+    ]
+    resp2 = post_compare(compare_payload(current2, reference="REF", tolerance=3000, baseline=baseline))
+    assert resp2.status_code == 422
+    assert any(
+        e["type"] == "corrected_coordinate_out_of_range" for e in resp2.json()["detail"]
+    )
+    assert "body -> current_points -> 1 -> x" in _locs(resp2)
+    assert "points" not in resp2.json()
+
+    # y 方向越界：修正量 (0, +2000)，P1 修正后 y = 1,001,000
+    current3 = [
+        {"name": "REF", "x": 0, "y": -2000},
+        {"name": "P1", "x": 999_000, "y": 999_000},
+    ]
+    resp3 = post_compare(compare_payload(current3, reference="REF", tolerance=3000, baseline=baseline))
+    assert resp3.status_code == 422
+    assert "body -> current_points -> 1 -> y" in _locs(resp3)
+
+
+def test_compare_point_field_types():
+    # 坐标必须是整数
+    resp = post_compare(compare_payload([{"name": "L1", "x": 0.5, "y": 0}]))
+    assert resp.status_code == 422
+    assert "body -> current_points -> 0 -> x" in _locs(resp)
+
+    # 布尔值不得冒充整数
+    assert post_compare(compare_payload([{"name": "L1", "x": True, "y": 0}])).status_code == 422
+
+    # 坐标越界
+    resp = post_compare(compare_payload([{"name": "L1", "x": 1_000_001, "y": 0}]))
+    assert resp.status_code == 422
+    assert any(e["type"] == "coordinate_out_of_range" for e in resp.json()["detail"])
+
+    # 空白名称
+    resp = post_compare(compare_payload([{"name": "  ", "x": 0, "y": 0}]))
+    assert resp.status_code == 422
+    assert any(e["type"] == "blank_point_name" for e in resp.json()["detail"])
+    assert "body -> current_points -> 0 -> name" in _locs(resp)
+
+    # 多余字段
+    resp = post_compare(compare_payload([{"name": "L1", "x": 0, "y": 0, "z": 1}]))
+    assert resp.status_code == 422
+    assert any(e["type"] == "extra_forbidden" for e in resp.json()["detail"])
+
+    # 空列表
+    resp = post_compare(compare_payload([]))
+    assert resp.status_code == 422
+    assert any(e["type"] == "too_short" for e in resp.json()["detail"])
+
+    # 缺少必填字段
+    resp = post_compare({"baseline_points": BASELINE_SECTION})
+    assert resp.status_code == 422
+    missing = {e["loc"][-1] for e in resp.json()["detail"] if e["type"] == "missing"}
+    assert {"current_points", "reference_point", "tolerance"} <= missing
+
+
+def test_compare_duplicate_name_and_invalid_coord_reported_together():
+    # 测点字段非法时，同组重名错误仍一并收集
+    current = [
+        {"name": "a", "x": 0, "y": 0},
+        {"name": "a", "x": 1.5, "y": 0},
+    ]
+    resp = post_compare(compare_payload(current, baseline=[dict(p) for p in current], reference="a"))
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    types = {e["type"] for e in detail}
+    assert "duplicate_point_name" in types
+    assert "int_type" in types
+    locs = _locs(resp)
+    assert "body -> baseline_points -> 1 -> name" in locs
+    assert "body -> current_points -> 1 -> x" in locs

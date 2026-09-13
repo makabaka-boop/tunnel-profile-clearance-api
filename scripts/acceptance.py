@@ -564,6 +564,242 @@ def main() -> int:
             json.dumps(body, ensure_ascii=False),
         )
 
+    # 13. 断面比对：纯整体平移 -> 修正后全部合格
+    section_baseline = [
+        {"name": "L1", "x": 0, "y": 0},
+        {"name": "L2", "x": 0, "y": 1200},
+        {"name": "C1", "x": 500, "y": 1500},
+        {"name": "R2", "x": 1000, "y": 1200},
+        {"name": "R1", "x": 1000, "y": 0},
+    ]
+    section_shifted = [
+        {"name": "L1", "x": -7, "y": 11},
+        {"name": "L2", "x": -7, "y": 1211},
+        {"name": "C1", "x": 493, "y": 1511},
+        {"name": "R2", "x": 993, "y": 1211},
+        {"name": "R1", "x": 993, "y": 11},
+    ]
+    status, body = post(
+        "/api/profiles/compare",
+        {
+            "baseline_points": section_baseline,
+            "current_points": section_shifted,
+            "reference_point": "C1",
+            "tolerance": 3,
+        },
+    )
+    check("case13 status 200", status == 200, str(body))
+    if status == 200:
+        check(
+            "case13 修正量为 (7, -11)",
+            body["correction"] == {"dx": 7, "dy": -11},
+            json.dumps(body.get("correction")),
+        )
+        check(
+            "case13 纯整体平移全部合格",
+            body["all_passed"] is True and body["exceeded_names"] == [],
+        )
+        check(
+            "case13 修正后坐标回到基准且逐点位移为 0",
+            [(p["x"], p["y"]) for p in body["points"]]
+            == [(0, 0), (0, 1200), (500, 1500), (1000, 1200), (1000, 0)]
+            and all(p["displacement_mm"] == 0.0 for p in body["points"]),
+            json.dumps(body.get("points"), ensure_ascii=False),
+        )
+        check(
+            "case13 全并列时最大位移取输入顺序最前者",
+            body["max_displacement_name"] == "L1"
+            and approx(body["max_displacement_mm"], 0.0),
+        )
+
+    # 14. 断面比对：单点真实位移被定位（C1 在整体平移之外另有 5mm 位移，
+    # 基准点取纯平移的 L1，修正量不被真实位移污染）
+    moved = [dict(p) for p in section_shifted]
+    moved[2] = {"name": "C1", "x": 496, "y": 1515}
+    status, body = post(
+        "/api/profiles/compare",
+        {
+            "baseline_points": section_baseline,
+            "current_points": moved,
+            "reference_point": "L1",
+            "tolerance": 4,
+        },
+    )
+    check("case14 status 200", status == 200, str(body))
+    if status == 200:
+        check(
+            "case14 修正量为 (7, -11)",
+            body["correction"] == {"dx": 7, "dy": -11},
+            json.dumps(body.get("correction")),
+        )
+        check("case14 all_passed=false", body["all_passed"] is False)
+        check(
+            "case14 超限列表唯一定位 C1",
+            body["exceeded_names"] == ["C1"],
+            json.dumps(body.get("exceeded_names")),
+        )
+        check(
+            "case14 最大位移测点为 C1 且 5.000mm",
+            body["max_displacement_name"] == "C1"
+            and approx(body["max_displacement_mm"], 5.0),
+        )
+        c1 = next(p for p in body["points"] if p["name"] == "C1")
+        check(
+            "case14 C1 修正后坐标 (503, 1504)，位移 5.000",
+            (c1["x"], c1["y"]) == (503, 1504) and approx(c1["displacement_mm"], 5.0),
+            json.dumps(c1),
+        )
+        others = [p for p in body["points"] if p["name"] != "C1"]
+        check(
+            "case14 其余测点零位移未误报",
+            all(p["displacement_mm"] == 0.0 for p in others),
+        )
+
+    # 15. 断面比对：最大位移并列时取输入顺序靠前者，交换顺序后结果稳定跟随
+    tie_baseline = [
+        {"name": "A", "x": 0, "y": 0},
+        {"name": "B", "x": 100, "y": 0},
+        {"name": "C", "x": 200, "y": 0},
+    ]
+    tie_current = [
+        {"name": "A", "x": 0, "y": 0},
+        {"name": "B", "x": 106, "y": 8},
+        {"name": "C", "x": 192, "y": 6},
+    ]
+    status, body = post(
+        "/api/profiles/compare",
+        {
+            "baseline_points": tie_baseline,
+            "current_points": tie_current,
+            "reference_point": "A",
+            "tolerance": 20,
+        },
+    )
+    check("case15 status 200", status == 200, str(body))
+    if status == 200:
+        check(
+            "case15 并列 10.000mm 取靠前的 B",
+            body["max_displacement_name"] == "B"
+            and approx(body["max_displacement_mm"], 10.0),
+            json.dumps(
+                {"name": body.get("max_displacement_name"), "mm": body.get("max_displacement_mm")}
+            ),
+        )
+    status, body = post(
+        "/api/profiles/compare",
+        {
+            "baseline_points": [tie_baseline[0], tie_baseline[2], tie_baseline[1]],
+            "current_points": [tie_current[0], tie_current[2], tie_current[1]],
+            "reference_point": "A",
+            "tolerance": 20,
+        },
+    )
+    check("case15 交换顺序 status 200", status == 200, str(body))
+    if status == 200:
+        check(
+            "case15 交换顺序后并列取靠前的 C",
+            body["max_displacement_name"] == "C",
+            json.dumps(body.get("max_displacement_name")),
+        )
+
+    # 16. 断面比对：名称顺序或数量不一致 -> 422，不生成部分报告
+    status, body = post(
+        "/api/profiles/compare",
+        {
+            "baseline_points": section_baseline,
+            "current_points": [section_shifted[1], section_shifted[0]] + section_shifted[2:],
+            "reference_point": "C1",
+            "tolerance": 3,
+        },
+    )
+    check("case16a status 422（名称顺序不一致）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check("case16a 含 point_name_mismatch", "point_name_mismatch" in types, str(types))
+        check(
+            "case16a 定位到 current_points.0.name",
+            "current_points -> 0 -> name" in " | ".join(locs),
+            str(locs),
+        )
+        check("case16a 不生成部分报告", "points" not in body)
+
+    status, body = post(
+        "/api/profiles/compare",
+        {
+            "baseline_points": section_baseline,
+            "current_points": section_shifted[:4],
+            "reference_point": "C1",
+            "tolerance": 3,
+        },
+    )
+    check("case16b status 422（数量不一致）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        check("case16b 含 point_count_mismatch", "point_count_mismatch" in types, str(types))
+        check("case16b 不生成部分报告", "points" not in body)
+
+    # 17. 断面比对：基准点缺失 / 容差为负 / 修正后坐标越界 -> 422
+    status, body = post(
+        "/api/profiles/compare",
+        {
+            "baseline_points": section_baseline,
+            "current_points": section_shifted,
+            "reference_point": "NOPE",
+            "tolerance": 3,
+        },
+    )
+    check("case17a status 422（基准点缺失）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check("case17a 含 reference_point_missing", "reference_point_missing" in types, str(types))
+        check("case17a 定位到 reference_point", "reference_point" in " | ".join(locs), str(locs))
+
+    status, body = post(
+        "/api/profiles/compare",
+        {
+            "baseline_points": section_baseline,
+            "current_points": section_shifted,
+            "reference_point": "C1",
+            "tolerance": -1,
+        },
+    )
+    check("case17b status 422（容差为负）", status == 422, str(body))
+    if status == 422:
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check("case17b 定位到 tolerance", "tolerance" in " | ".join(locs), str(locs))
+
+    status, body = post(
+        "/api/profiles/compare",
+        {
+            "baseline_points": [
+                {"name": "REF", "x": 0, "y": 0},
+                {"name": "P1", "x": 999_000, "y": 0},
+            ],
+            "current_points": [
+                {"name": "REF", "x": -2000, "y": 0},
+                {"name": "P1", "x": 998_001, "y": 0},
+            ],
+            "reference_point": "REF",
+            "tolerance": 3000,
+        },
+    )
+    check("case17c status 422（修正后坐标越界）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check(
+            "case17c 含 corrected_coordinate_out_of_range",
+            "corrected_coordinate_out_of_range" in types,
+            str(types),
+        )
+        check(
+            "case17c 定位到 current_points.1.x",
+            "current_points -> 1 -> x" in " | ".join(locs),
+            str(locs),
+        )
+
     print()
     if failures:
         print(f"验收失败：{len(failures)} 项")
