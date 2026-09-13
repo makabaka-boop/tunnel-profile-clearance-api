@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from .comparison import compare_profiles
+from .comparison import align_to_reference, compare_profiles
 from .geometry import minimum_segment_pair, round_three
 from .schemas import (
+    ClearanceImpactRequest,
+    ClearanceImpactResponse,
     ClearanceRequest,
     ClearanceResponse,
     ClearanceSeriesRequest,
@@ -23,8 +25,8 @@ from .schemas import (
 
 app = FastAPI(
     title="隧道限界复核 API",
-    version="1.2.0",
-    description="纯后端 JSON API：计算隧道折线与车辆限界多边形之间的全局最小净距，支持单点与批量平移位置复核；并支持同一断面两期测点的基准点对齐比对。",
+    version="1.3.0",
+    description="纯后端 JSON API：计算隧道折线与车辆限界多边形之间的全局最小净距，支持单点与批量平移位置复核；支持同一断面两期测点的基准点对齐比对，以及两期测点折线的限界净距影响复核。",
 )
 
 
@@ -38,11 +40,12 @@ def _segment_ref(points, index: int, *, closed: bool) -> SegmentRef:
     )
 
 
-def _conclusion(tunnel_points, vehicle_points, required: int) -> ClearanceResponse:
-    """对一组顶点计算净距结论（vehicle_points 为已施加平移后的坐标）。
+def _conclusion_with_distance(
+    tunnel_points, vehicle_points, required: int
+) -> tuple[ClearanceResponse, float]:
+    """对一组顶点计算净距结论，并同时返回未舍入的双精度最小距离。
 
-    未舍入的双精度最小距离 + 按规则选出的唯一线段对；
-    通过条件：未相交/接触，且未舍入最小距离 >= 要求净距。
+    未舍入距离供影响报告计算两期净距变化值；结论结构与 _conclusion 完全一致。
     """
     tunnel = [(float(x), float(y)) for x, y in tunnel_points]
     vehicle = [(float(x), float(y)) for x, y in vehicle_points]
@@ -51,7 +54,7 @@ def _conclusion(tunnel_points, vehicle_points, required: int) -> ClearanceRespon
     intersects = distance == 0.0
     passed = (not intersects) and distance >= float(required)
 
-    return ClearanceResponse(
+    conclusion = ClearanceResponse(
         passed=passed,
         minimum_clearance_mm=round_three(distance),
         required_clearance_mm=required,
@@ -62,6 +65,17 @@ def _conclusion(tunnel_points, vehicle_points, required: int) -> ClearanceRespon
             distance_mm=round_three(distance),
         ),
     )
+    return conclusion, distance
+
+
+def _conclusion(tunnel_points, vehicle_points, required: int) -> ClearanceResponse:
+    """对一组顶点计算净距结论（vehicle_points 为已施加平移后的坐标）。
+
+    未舍入的双精度最小距离 + 按规则选出的唯一线段对；
+    通过条件：未相交/接触，且未舍入最小距离 >= 要求净距。
+    """
+    conclusion, _ = _conclusion_with_distance(tunnel_points, vehicle_points, required)
+    return conclusion
 
 
 @app.get("/health")
@@ -121,4 +135,30 @@ def compare_profile_points(req: ProfileCompareRequest) -> ProfileCompareResponse
         max_displacement_mm=result.max_displacement_mm,
         exceeded_names=result.exceeded_names,
         all_passed=result.all_passed,
+    )
+
+
+@app.post("/api/profiles/clearance-impact", response_model=ClearanceImpactResponse)
+def clearance_impact(req: ClearanceImpactRequest) -> ClearanceImpactResponse:
+    # 模型层已保证：两组名称序列一致且组内唯一、基准点唯一存在、修正后坐标不越界、
+    # 两期测点均不少于 2 个且相邻不重合、车辆轮廓有效；路由只负责编排计算
+    baseline = [(p.name, p.x, p.y) for p in req.baseline_points]
+    current = [(p.name, p.x, p.y) for p in req.current_points]
+    # 先按现有基准点规则修正本期坐标，再把两期序列分别作为不闭合折线复核净距
+    _, _, corrected = align_to_reference(baseline, current, req.reference_point)
+
+    vehicle = [(p.x, p.y) for p in req.vehicle_polygon.points]
+    baseline_conclusion, baseline_distance = _conclusion_with_distance(
+        [(x, y) for _, x, y in baseline], vehicle, req.required_clearance
+    )
+    current_conclusion, current_distance = _conclusion_with_distance(
+        [(x, y) for _, x, y in corrected], vehicle, req.required_clearance
+    )
+
+    return ClearanceImpactResponse(
+        baseline=baseline_conclusion,
+        current=current_conclusion,
+        # 净距变化值基于未舍入距离求差，输出再舍入到三位小数
+        clearance_change_mm=round_three(current_distance - baseline_distance),
+        became_noncompliant=baseline_conclusion.passed and not current_conclusion.passed,
     )

@@ -800,6 +800,231 @@ def main() -> int:
             str(locs),
         )
 
+    # 18. 限界影响复核：纯整体平移 -> 两期净距结论逐字段一致，变化为 0
+    vehicle_rect = {
+        "points": [
+            {"x": 200, "y": 200},
+            {"x": 800, "y": 200},
+            {"x": 800, "y": 1000},
+            {"x": 200, "y": 1000},
+        ]
+    }
+    status, body = post(
+        "/api/profiles/clearance-impact",
+        {
+            "baseline_points": section_baseline,
+            "current_points": section_shifted,
+            "reference_point": "C1",
+            "vehicle_polygon": vehicle_rect,
+            "required_clearance": 200,
+        },
+    )
+    check("case18 status 200", status == 200, str(body))
+    if status == 200:
+        check(
+            "case18 纯整体平移两期结论一致",
+            body["baseline"] == body["current"],
+            json.dumps(body, ensure_ascii=False),
+        )
+        check("case18 净距变化 0.000", approx(body["clearance_change_mm"], 0.0))
+        check("case18 未转为不合格", body["became_noncompliant"] is False)
+        check(
+            "case18 基准期净距 200.000 且合格",
+            body["baseline"]["passed"] is True
+            and approx(body["baseline"]["minimum_clearance_mm"], 200.0),
+        )
+        check(
+            "case18 危险对为隧道边0 / 限界边0（并列取索引较小者）",
+            body["baseline"]["dangerous_pair"]["tunnel_segment"]["start_index"] == 0
+            and body["baseline"]["dangerous_pair"]["vehicle_segment"]["start_index"] == 0,
+            json.dumps(body["baseline"]["dangerous_pair"], ensure_ascii=False),
+        )
+
+    # 19. 限界影响复核：局部变形（C1 真实下沉 400mm）-> 由合格转为不合格，
+    # 危险边定位到变形产生的边且并列选择稳定
+    deformed = [dict(p) for p in section_shifted]
+    deformed[2] = {"name": "C1", "x": 493, "y": 1111}  # 修正后 (500,1100)，距限界顶边 100mm
+    status, body = post(
+        "/api/profiles/clearance-impact",
+        {
+            "baseline_points": section_baseline,
+            "current_points": deformed,
+            "reference_point": "L1",
+            "vehicle_polygon": vehicle_rect,
+            "required_clearance": 150,
+        },
+    )
+    check("case19 status 200", status == 200, str(body))
+    if status == 200:
+        check(
+            "case19 基准期合格 / 本期不合格",
+            body["baseline"]["passed"] is True and body["current"]["passed"] is False,
+        )
+        check("case19 由合格转为不合格", body["became_noncompliant"] is True)
+        check(
+            "case19 本期净距 100.000，变化 -100.000",
+            approx(body["current"]["minimum_clearance_mm"], 100.0)
+            and approx(body["clearance_change_mm"], -100.0),
+            json.dumps(
+                {
+                    "current": body["current"]["minimum_clearance_mm"],
+                    "change": body["clearance_change_mm"],
+                }
+            ),
+        )
+        pair = body["current"]["dangerous_pair"]
+        check(
+            "case19 危险边为隧道边1（修正后 (0,1200)->(500,1100)）/ 限界边2，并列取边1",
+            pair["tunnel_segment"]["start_index"] == 1
+            and pair["tunnel_segment"]["start"] == {"x": 0, "y": 1200}
+            and pair["tunnel_segment"]["end"] == {"x": 500, "y": 1100}
+            and pair["vehicle_segment"]["start_index"] == 2
+            and approx(pair["distance_mm"], 100.0),
+            json.dumps(pair, ensure_ascii=False),
+        )
+
+    # 20. 限界影响复核：无效输入 -> 422 并定位具体字段，不产生半份影响报告
+    impact_base = {
+        "baseline_points": section_baseline,
+        "current_points": section_shifted,
+        "reference_point": "C1",
+        "vehicle_polygon": vehicle_rect,
+        "required_clearance": 150,
+    }
+
+    # 20a. 任一期相邻测点重合（无效折线）
+    dup_baseline = [dict(p) for p in section_baseline]
+    dup_baseline[2] = {"name": "C1", "x": 0, "y": 1200}
+    status, body = post(
+        "/api/profiles/clearance-impact", {**impact_base, "baseline_points": dup_baseline}
+    )
+    check("case20a status 422（基准期相邻测点重合）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check("case20a 含 duplicate_adjacent_point", "duplicate_adjacent_point" in types, str(types))
+        check(
+            "case20a 定位到 baseline_points.2",
+            "baseline_points -> 2" in " | ".join(locs),
+            str(locs),
+        )
+        check("case20a 不产生半份影响报告", "baseline" not in body and "current" not in body)
+
+    dup_current = [dict(p) for p in section_shifted]
+    dup_current[1] = {"name": "L2", "x": -7, "y": 11}
+    status, body = post(
+        "/api/profiles/clearance-impact", {**impact_base, "current_points": dup_current}
+    )
+    check("case20b status 422（本期相邻测点重合）", status == 422, str(body))
+    if status == 422:
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check(
+            "case20b 定位到 current_points.1",
+            "current_points -> 1" in " | ".join(locs),
+            str(locs),
+        )
+        check("case20b 不产生半份影响报告", "baseline" not in body)
+
+    # 20c. 名称顺序 / 数量不一致
+    status, body = post(
+        "/api/profiles/clearance-impact",
+        {
+            **impact_base,
+            "current_points": [section_shifted[1], section_shifted[0]] + section_shifted[2:],
+        },
+    )
+    check("case20c status 422（名称顺序不一致）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        check("case20c 含 point_name_mismatch", "point_name_mismatch" in types, str(types))
+        check("case20c 不产生半份影响报告", "baseline" not in body)
+
+    status, body = post(
+        "/api/profiles/clearance-impact",
+        {**impact_base, "current_points": section_shifted[:4]},
+    )
+    check("case20d status 422（数量不一致）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        check("case20d 含 point_count_mismatch", "point_count_mismatch" in types, str(types))
+
+    # 20e. 基准点缺失
+    status, body = post(
+        "/api/profiles/clearance-impact", {**impact_base, "reference_point": "NOPE"}
+    )
+    check("case20e status 422（基准点缺失）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check("case20e 含 reference_point_missing", "reference_point_missing" in types, str(types))
+        check("case20e 定位到 reference_point", "reference_point" in " | ".join(locs), str(locs))
+
+    # 20f. 修正后坐标越界
+    status, body = post(
+        "/api/profiles/clearance-impact",
+        {
+            **impact_base,
+            "baseline_points": [
+                {"name": "REF", "x": 0, "y": 0},
+                {"name": "P1", "x": 999_000, "y": 0},
+            ],
+            "current_points": [
+                {"name": "REF", "x": -2000, "y": 0},
+                {"name": "P1", "x": 998_001, "y": 0},
+            ],
+            "reference_point": "REF",
+        },
+    )
+    check("case20f status 422（修正后坐标越界）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check(
+            "case20f 含 corrected_coordinate_out_of_range",
+            "corrected_coordinate_out_of_range" in types,
+            str(types),
+        )
+        check(
+            "case20f 定位到 current_points.1.x",
+            "current_points -> 1 -> x" in " | ".join(locs),
+            str(locs),
+        )
+
+    # 20g. 车辆轮廓无效（自交）
+    status, body = post(
+        "/api/profiles/clearance-impact",
+        {
+            **impact_base,
+            "vehicle_polygon": {
+                "points": [
+                    {"x": 0, "y": 0},
+                    {"x": 1000, "y": 1000},
+                    {"x": 1000, "y": 0},
+                    {"x": 0, "y": 1000},
+                ]
+            },
+        },
+    )
+    check("case20g status 422（车辆轮廓自交）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        check(
+            "case20g 含 self_intersecting_polygon",
+            "self_intersecting_polygon" in types,
+            str(types),
+        )
+        check("case20g 不产生半份影响报告", "baseline" not in body)
+
+    # 20h. 单点序列无法构成折线
+    status, body = post(
+        "/api/profiles/clearance-impact",
+        {**impact_base, "current_points": section_shifted[:1], "baseline_points": section_baseline[:1]},
+    )
+    check("case20h status 422（单点无法构成折线）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        check("case20h 含 too_short", "too_short" in types, str(types))
+
     print()
     if failures:
         print(f"验收失败：{len(failures)} 项")

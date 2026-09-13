@@ -1,6 +1,27 @@
 """断面比对服务（纯 Python 层）契约测试。"""
 
-from app.comparison import compare_profiles
+from app.comparison import align_to_reference, compare_profiles
+
+
+def test_align_to_reference_returns_correction_and_corrected_sequence():
+    # 本期整体平移 (-10, -5)：修正量 = 基准基准点 - 本期基准点 = (+10, +5)，
+    # 修正后序列保持本期输入顺序
+    dx, dy, corrected = align_to_reference(
+        [("A", 100, 200), ("B", 300, 400)],
+        [("A", 90, 195), ("B", 290, 395)],
+        "A",
+    )
+    assert (dx, dy) == (10, 5)
+    assert corrected == [("A", 100, 200), ("B", 300, 400)]
+
+    # 基准点不必是首点：以 B 为基准点时修正量由 B 决定
+    dx2, dy2, corrected2 = align_to_reference(
+        [("A", 100, 200), ("B", 300, 400)],
+        [("A", 90, 195), ("B", 290, 395)],
+        "B",
+    )
+    assert (dx2, dy2) == (10, 5)
+    assert corrected2 == corrected
 
 
 def test_correction_is_reference_difference():

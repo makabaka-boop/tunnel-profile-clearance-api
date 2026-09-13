@@ -362,7 +362,7 @@ class ProfilePoint(BaseModel):
 
 
 def _validate_named_points_field(
-    value: object, handler, *, field_name: str
+    value: object, handler, *, field_name: str, owner_name: str
 ) -> list[ProfilePoint]:
     """校验测点列表，并在嵌套字段错误时仍收集组内重名错误。"""
     try:
@@ -410,7 +410,115 @@ def _validate_named_points_field(
 
         if not line_errors:
             raise
-        raise ValidationError.from_exception_data(ProfileCompareRequest.__name__, line_errors) from exc
+        raise ValidationError.from_exception_data(owner_name, line_errors) from exc
+
+
+def _profile_pair_errors(
+    baseline_points: list[ProfilePoint],
+    current_points: list[ProfilePoint],
+    reference_point: str,
+) -> list[dict]:
+    """两期测点共有校验：组内重名、名称序列一致、基准点存在、修正后不越界。
+
+    供 ProfileCompareRequest 与 ClearanceImpactRequest 复用，保证两接口语义一致。
+    """
+    errors: list[dict] = []
+
+    # 各组内名称唯一（定位到重复出现的后者）
+    for field_name, points in (
+        ("baseline_points", baseline_points),
+        ("current_points", current_points),
+    ):
+        seen: dict[str, int] = {}
+        for idx, point in enumerate(points):
+            first = seen.get(point.name)
+            if first is not None:
+                errors.append(
+                    {
+                        "type": PydanticCustomError(
+                            "duplicate_point_name",
+                            f"测点名称重复：{point.name}（首次出现于第 {first} 个测点），同组内名称必须唯一",
+                        ),
+                        "loc": (field_name, idx, "name"),
+                    }
+                )
+            else:
+                seen[point.name] = idx
+
+    # 两组名称序列必须完全一致（数量 + 顺序），定位到首个分歧
+    if len(baseline_points) != len(current_points):
+        errors.append(
+            {
+                "type": PydanticCustomError(
+                    "point_count_mismatch",
+                    f"本期测点数量（{len(current_points)}）与基准测点数量"
+                    f"（{len(baseline_points)}）不一致，两组测点数量与名称顺序必须完全对应",
+                ),
+                "loc": ("current_points",),
+            }
+        )
+    else:
+        for idx, (base, curr) in enumerate(zip(baseline_points, current_points)):
+            if base.name != curr.name:
+                errors.append(
+                    {
+                        "type": PydanticCustomError(
+                            "point_name_mismatch",
+                            f"第 {idx} 个测点名称不一致：基准为 '{base.name}'，本期为 '{curr.name}'，"
+                            "两组测点名称与顺序必须完全对应",
+                        ),
+                        "loc": ("current_points", idx, "name"),
+                    }
+                )
+                break
+
+    # 基准点必须同时存在于两组（基准点自身重复时重名错误已报告，不再重复检查）
+    ref_in_baseline = [p for p in baseline_points if p.name == reference_point]
+    ref_in_current = [p for p in current_points if p.name == reference_point]
+    if not ref_in_baseline or not ref_in_current:
+        if not ref_in_baseline and not ref_in_current:
+            msg = f"基准点 '{reference_point}' 在基准测点与本期测点中均不存在"
+        elif not ref_in_baseline:
+            msg = f"基准点 '{reference_point}' 不存在于基准测点中"
+        else:
+            msg = f"基准点 '{reference_point}' 不存在于本期测点中"
+        errors.append(
+            {
+                "type": PydanticCustomError("reference_point_missing", msg),
+                "loc": ("reference_point",),
+            }
+        )
+    elif len(ref_in_baseline) == 1 and len(ref_in_current) == 1:
+        # 修正后坐标不得越过既有范围（±1,000,000 毫米）
+        dx = ref_in_baseline[0].x - ref_in_current[0].x
+        dy = ref_in_baseline[0].y - ref_in_current[0].y
+        for idx, point in enumerate(current_points):
+            cx = point.x + dx
+            cy = point.y + dy
+            if abs(cx) > COORD_LIMIT:
+                errors.append(
+                    {
+                        "type": PydanticCustomError(
+                            "corrected_coordinate_out_of_range",
+                            f"测点 {point.name} 修正后 x 坐标为 {cx}，"
+                            f"绝对值不得超过 {COORD_LIMIT} 毫米",
+                        ),
+                        "loc": ("current_points", idx, "x"),
+                    }
+                )
+            if abs(cy) > COORD_LIMIT:
+                errors.append(
+                    {
+                        "type": PydanticCustomError(
+                            "corrected_coordinate_out_of_range",
+                            f"测点 {point.name} 修正后 y 坐标为 {cy}，"
+                            f"绝对值不得超过 {COORD_LIMIT} 毫米",
+                        ),
+                        "loc": ("current_points", idx, "y"),
+                    }
+                )
+
+    return errors
 
 
 class ProfileCompareRequest(BaseModel):
@@ -438,114 +546,86 @@ class ProfileCompareRequest(BaseModel):
     @field_validator("baseline_points", mode="wrap")
     @classmethod
     def _validate_baseline_points_field(cls, value: object, handler) -> list[ProfilePoint]:
-        return _validate_named_points_field(value, handler, field_name="baseline_points")
+        return _validate_named_points_field(
+            value, handler, field_name="baseline_points", owner_name=cls.__name__
+        )
 
     @field_validator("current_points", mode="wrap")
     @classmethod
     def _validate_current_points_field(cls, value: object, handler) -> list[ProfilePoint]:
-        return _validate_named_points_field(value, handler, field_name="current_points")
+        return _validate_named_points_field(
+            value, handler, field_name="current_points", owner_name=cls.__name__
+        )
 
     @model_validator(mode="after")
     def _validate_comparison(self) -> "ProfileCompareRequest":
-        errors: list[dict] = []
+        errors = _profile_pair_errors(
+            self.baseline_points, self.current_points, self.reference_point
+        )
+        if errors:
+            raise ValidationError.from_exception_data(self.__class__.__name__, errors)
+        return self
 
-        # 各组内名称唯一（定位到重复出现的后者）
-        for field_name, points in (
-            ("baseline_points", self.baseline_points),
-            ("current_points", self.current_points),
+
+class ClearanceImpactRequest(BaseModel):
+    """两期测点的限界影响复核请求：两期测点序列分别作为不闭合隧道折线。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    baseline_points: list[ProfilePoint] = Field(
+        ..., min_length=2, description="基准测点列表（至少 2 个，按顺序构成不闭合折线），名称组内唯一"
+    )
+    current_points: list[ProfilePoint] = Field(
+        ...,
+        min_length=2,
+        description="本期测点列表（至少 2 个），名称与顺序须与基准测点完全一致",
+    )
+    reference_point: str = Field(
+        ..., min_length=1, description="两组中共同存在的基准点名称，用于对齐仪器整体平移"
+    )
+    vehicle_polygon: VehicleGauge
+    required_clearance: StrictInt = Field(
+        ...,
+        ge=-COORD_LIMIT,
+        le=COORD_LIMIT,
+        description="要求净距（毫米，整数，|required_clearance| <= 1,000,000）",
+    )
+
+    @field_validator("baseline_points", mode="wrap")
+    @classmethod
+    def _validate_baseline_points_field(cls, value: object, handler) -> list[ProfilePoint]:
+        return _validate_named_points_field(
+            value, handler, field_name="baseline_points", owner_name=cls.__name__
+        )
+
+    @field_validator("current_points", mode="wrap")
+    @classmethod
+    def _validate_current_points_field(cls, value: object, handler) -> list[ProfilePoint]:
+        return _validate_named_points_field(
+            value, handler, field_name="current_points", owner_name=cls.__name__
+        )
+
+    @model_validator(mode="after")
+    def _validate_impact(self) -> "ClearanceImpactRequest":
+        errors = _profile_pair_errors(
+            self.baseline_points, self.current_points, self.reference_point
+        )
+
+        # 相邻测点不得重合：两期序列分别作为不闭合折线进入净距计算，
+        # 零长线段没有几何意义（平移修正不改变重合关系，修正前后判定一致）
+        for field_name, label, points in (
+            ("baseline_points", "基准测点", self.baseline_points),
+            ("current_points", "本期测点", self.current_points),
         ):
-            seen: dict[str, int] = {}
-            for idx, point in enumerate(points):
-                first = seen.get(point.name)
-                if first is not None:
+            for k in range(1, len(points)):
+                if points[k].x == points[k - 1].x and points[k].y == points[k - 1].y:
                     errors.append(
                         {
                             "type": PydanticCustomError(
-                                "duplicate_point_name",
-                                f"测点名称重复：{point.name}（首次出现于第 {first} 个测点），同组内名称必须唯一",
+                                "duplicate_adjacent_point",
+                                f"{label}第 {k} 个测点与前一点重合，作为折线的相邻测点不得相同",
                             ),
-                            "loc": (field_name, idx, "name"),
-                        }
-                    )
-                else:
-                    seen[point.name] = idx
-
-        # 两组名称序列必须完全一致（数量 + 顺序），定位到首个分歧
-        if len(self.baseline_points) != len(self.current_points):
-            errors.append(
-                {
-                    "type": PydanticCustomError(
-                        "point_count_mismatch",
-                        f"本期测点数量（{len(self.current_points)}）与基准测点数量"
-                        f"（{len(self.baseline_points)}）不一致，两组测点数量与名称顺序必须完全对应",
-                    ),
-                    "loc": ("current_points",),
-                }
-            )
-        else:
-            for idx, (base, curr) in enumerate(
-                zip(self.baseline_points, self.current_points)
-            ):
-                if base.name != curr.name:
-                    errors.append(
-                        {
-                            "type": PydanticCustomError(
-                                "point_name_mismatch",
-                                f"第 {idx} 个测点名称不一致：基准为 '{base.name}'，本期为 '{curr.name}'，"
-                                "两组测点名称与顺序必须完全对应",
-                            ),
-                            "loc": ("current_points", idx, "name"),
-                        }
-                    )
-                    break
-
-        # 基准点必须同时存在于两组（基准点自身重复时重名错误已报告，不再重复检查）
-        ref_in_baseline = [
-            p for p in self.baseline_points if p.name == self.reference_point
-        ]
-        ref_in_current = [
-            p for p in self.current_points if p.name == self.reference_point
-        ]
-        if not ref_in_baseline or not ref_in_current:
-            if not ref_in_baseline and not ref_in_current:
-                msg = f"基准点 '{self.reference_point}' 在基准测点与本期测点中均不存在"
-            elif not ref_in_baseline:
-                msg = f"基准点 '{self.reference_point}' 不存在于基准测点中"
-            else:
-                msg = f"基准点 '{self.reference_point}' 不存在于本期测点中"
-            errors.append(
-                {
-                    "type": PydanticCustomError("reference_point_missing", msg),
-                    "loc": ("reference_point",),
-                }
-            )
-        elif len(ref_in_baseline) == 1 and len(ref_in_current) == 1:
-            # 修正后坐标不得越过既有范围（±1,000,000 毫米）
-            dx = ref_in_baseline[0].x - ref_in_current[0].x
-            dy = ref_in_baseline[0].y - ref_in_current[0].y
-            for idx, point in enumerate(self.current_points):
-                cx = point.x + dx
-                cy = point.y + dy
-                if abs(cx) > COORD_LIMIT:
-                    errors.append(
-                        {
-                            "type": PydanticCustomError(
-                                "corrected_coordinate_out_of_range",
-                                f"测点 {point.name} 修正后 x 坐标为 {cx}，"
-                                f"绝对值不得超过 {COORD_LIMIT} 毫米",
-                            ),
-                            "loc": ("current_points", idx, "x"),
-                        }
-                    )
-                if abs(cy) > COORD_LIMIT:
-                    errors.append(
-                        {
-                            "type": PydanticCustomError(
-                                "corrected_coordinate_out_of_range",
-                                f"测点 {point.name} 修正后 y 坐标为 {cy}，"
-                                f"绝对值不得超过 {COORD_LIMIT} 毫米",
-                            ),
-                            "loc": ("current_points", idx, "y"),
+                            "loc": (field_name, k),
                         }
                     )
 
@@ -634,3 +714,17 @@ class ProfileCompareResponse(BaseModel):
         ..., description="位移超过容差的测点名称，按输入顺序排列"
     )
     all_passed: bool = Field(..., description="全部测点位移均未超过容差时为 true")
+
+
+class ClearanceImpactResponse(BaseModel):
+    """两期限界影响报告：基准期与本期（修正后）各自的完整净距结论 + 净距变化。"""
+
+    baseline: ClearanceResponse = Field(..., description="基准期测点折线的净距结论")
+    current: ClearanceResponse = Field(..., description="本期测点修正后折线的净距结论")
+    clearance_change_mm: float = Field(
+        ...,
+        description="本期最小净距减基准期最小净距（毫米，未舍入差值四舍五入到三位小数）",
+    )
+    became_noncompliant: bool = Field(
+        ..., description="基准期合格而本期不合格（由合格转为不合格）时为 true"
+    )

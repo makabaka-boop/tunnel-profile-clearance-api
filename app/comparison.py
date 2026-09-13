@@ -42,6 +42,27 @@ class ComparisonResult:
     all_passed: bool
 
 
+def align_to_reference(
+    baseline_points: list[NamedPoint],
+    current_points: list[NamedPoint],
+    reference_name: str,
+) -> tuple[int, int, list[NamedPoint]]:
+    """按共同基准点规则修正本期坐标：返回 (dx, dy, 修正后的本期测点序列)。
+
+    修正量 (dx, dy) = 基准组基准点坐标 - 本期组基准点坐标；
+    修正后序列保持本期输入顺序。契约与 compare_profiles 相同
+    （调用方已在模型层保证基准点唯一存在于两组）。
+    """
+    base_by_name = {name: (x, y) for name, x, y in baseline_points}
+    curr_by_name = {name: (x, y) for name, x, y in current_points}
+    base_ref = base_by_name[reference_name]
+    curr_ref = curr_by_name[reference_name]
+    dx = base_ref[0] - curr_ref[0]
+    dy = base_ref[1] - curr_ref[1]
+    corrected = [(name, x + dx, y + dy) for name, x, y in current_points]
+    return dx, dy, corrected
+
+
 def compare_profiles(
     baseline_points: list[NamedPoint],
     current_points: list[NamedPoint],
@@ -55,21 +76,15 @@ def compare_profiles(
     - 输出位移四舍五入到三位小数（ROUND_HALF_UP）；
     - 最大位移并列时保留输入顺序靠前的测点（严格更大才替换）。
     """
+    dx, dy, corrected = align_to_reference(baseline_points, current_points, reference_name)
     base_by_name = {name: (x, y) for name, x, y in baseline_points}
-    curr_by_name = {name: (x, y) for name, x, y in current_points}
-    base_ref = base_by_name[reference_name]
-    curr_ref = curr_by_name[reference_name]
-    dx = base_ref[0] - curr_ref[0]
-    dy = base_ref[1] - curr_ref[1]
 
     points: list[ComparedPoint] = []
     exceeded: list[str] = []
     max_name = ""
     max_displacement = -1.0  # 位移恒为非负，首个测点必然替换该哨兵
 
-    for name, x, y in current_points:
-        cx = x + dx
-        cy = y + dy
+    for name, cx, cy in corrected:
         bx, by = base_by_name[name]
         displacement = math.hypot(cx - bx, cy - by)
         points.append(

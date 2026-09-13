@@ -3,7 +3,8 @@
 纯后端 JSON API：输入**激光测量导出的隧道断面折线**与**车辆限界多边形**（坐标均为毫米整数），
 计算两组线段之间的全局最小欧氏距离，判定车辆限界是否满足指定净距，并定位**唯一的最危险线段对**。
 支持单点复核与**批量平移位置复核**（同一断面上一至五十个摆放位置一次核验）。
-另支持**同一断面两期测点比对**：以共同基准点排除仪器整体平移后，逐点计算位移并判定是否超过容差。
+另支持**同一断面两期测点比对**：以共同基准点排除仪器整体平移后，逐点计算位移并判定是否超过容差；
+以及**两期限界影响复核**：把两期测点序列分别作为不闭合折线复核净距，给出净距变化与是否由合格转为不合格。
 全程不依赖 CAD 软件，也不依赖任何第三方几何库——线段相交、点到线段距离均为自行实现。
 
 - Python 3.12 · FastAPI · Pydantic v2
@@ -44,7 +45,8 @@ docker compose up --build
 - `verify` 是**一次性验收服务**：等待 `api` 健康检查通过后，对其执行端到端断言
   （通过 / 不通过 / 相交 / 闭合边 / 四舍五入 / 字段级错误 / 自交多边形 /
   批量位置全过 / 首个失败不中断 / 平移越界定位 / 旧接口响应不变 /
-  断面比对纯平移全过 / 单点位移定位 / 并列选择稳定 / 名称不匹配拒绝），
+  断面比对纯平移全过 / 单点位移定位 / 并列选择稳定 / 名称不匹配拒绝 /
+  限界影响纯平移不变 / 局部变形失格 / 无效折线拒绝），
   打印 `[PASS]`/`[FAIL]` 后退出，退出码即验收结论（0 通过）。可单独运行：
 
   ```bash
@@ -62,7 +64,7 @@ docker compose up --build
 python3.12 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload
-pytest                 # 88 项测试
+pytest                 # 106 项测试
 BASE_URL=http://127.0.0.1:8000 python scripts/acceptance.py
 ```
 
@@ -283,6 +285,104 @@ curl -s http://localhost:8000/api/profiles/compare \
   定位到 `current_points.<下标>.x` 或 `.<下标>.y`；
 - 测点名称仅含空白字符：`blank_point_name`；坐标非整数 / 越界、多余字段等同既有规则。
 
+### `POST /api/profiles/clearance-impact`
+
+两期限界影响复核：断面复核人员确认测点变化后，进一步判断这些变化是否让车辆限界
+失去安全净距。输入两期测点、共同基准点、车辆限界与要求净距，先按既有基准点规则
+修正本期坐标，再把两期测点序列分别作为**不闭合隧道折线**复用净距算法，一次给出
+两期结论与净距变化。
+
+请求体（坐标为**毫米整数**，绝对值不超过 1,000,000）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `baseline_points` | 基准测点列表（**至少 2 个**，按顺序构成不闭合折线），名称组内唯一 |
+| `current_points` | 本期测点列表，名称与顺序须与 `baseline_points` **完全一致** |
+| `reference_point` | 两组中共同存在的基准点名称，用于对齐整体平移 |
+| `vehicle_polygon` | 车辆限界多边形，规则同 `check` |
+| `required_clearance` | 要求净距（毫米整数） |
+
+```bash
+curl -s http://localhost:8000/api/profiles/clearance-impact \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "baseline_points": [
+      {"name": "L1", "x": 0,   "y": 0},
+      {"name": "L2", "x": 0,   "y": 1200},
+      {"name": "C1", "x": 500, "y": 1500},
+      {"name": "R2", "x": 1000,"y": 1200},
+      {"name": "R1", "x": 1000,"y": 0}
+    ],
+    "current_points": [
+      {"name": "L1", "x": -7,  "y": 11},
+      {"name": "L2", "x": -7,  "y": 1211},
+      {"name": "C1", "x": 493, "y": 1111},
+      {"name": "R2", "x": 993, "y": 1211},
+      {"name": "R1", "x": 993, "y": 11}
+    ],
+    "reference_point": "L1",
+    "vehicle_polygon": {
+      "points": [
+        {"x": 200, "y": 200},
+        {"x": 800, "y": 200},
+        {"x": 800, "y": 1000},
+        {"x": 200, "y": 1000}
+      ]
+    },
+    "required_clearance": 150
+  }'
+```
+
+响应（修正量 `(7, -11)`，C1 修正后 `(500, 1100)` 距限界顶边仅 100mm，由合格转为不合格）：
+
+```json
+{
+  "baseline": {
+    "passed": true,
+    "minimum_clearance_mm": 200.0,
+    "required_clearance_mm": 150,
+    "intersects": false,
+    "dangerous_pair": { "tunnel_segment": {}, "vehicle_segment": {}, "distance_mm": 200.0 }
+  },
+  "current": {
+    "passed": false,
+    "minimum_clearance_mm": 100.0,
+    "required_clearance_mm": 150,
+    "intersects": false,
+    "dangerous_pair": {
+      "tunnel_segment": {
+        "start_index": 1,
+        "start": {"x": 0, "y": 1200},
+        "end": {"x": 500, "y": 1100}
+      },
+      "vehicle_segment": {},
+      "distance_mm": 100.0
+    }
+  },
+  "clearance_change_mm": -100.0,
+  "became_noncompliant": true
+}
+```
+
+字段说明：
+
+- `baseline` / `current`：基准期与本期（**修正后**）折线的完整净距结论，
+  结构与判定语义同 `check`（未舍入距离比较、三位小数舍入、危险边并列选择）；
+  本期危险边端点展示**修正后**坐标，线段起点索引对应测点序列下标；
+- `clearance_change_mm`：本期最小净距减基准期最小净距，基于**未舍入**距离求差后
+  四舍五入到三位小数；负值表示净距被侵蚀；
+- `became_noncompliant`：基准期合格而本期不合格时为 `true`；
+  两期均不合格或均合格时均为 `false`。
+
+影响复核特有的 `422` 校验（复用既有错误信封，**任何校验失败都不产生半份影响报告**）：
+
+- 名称顺序 / 数量不一致、组内重名、基准点缺失、修正后坐标越界：与 `compare` 完全相同的
+  错误类型与字段定位；
+- 任一期相邻测点重合（零长线段无法构成折线）：`duplicate_adjacent_point`，
+  定位到 `baseline_points.<下标>` 或 `current_points.<下标>`；
+- 任一期测点少于 2 个：`too_short`，定位到对应测点列表；
+- 车辆轮廓无效（自交 / 零面积 / 重复首点等）：与 `check` 完全相同的校验规则。
+
 交互式文档：启动后访问 `http://localhost:8000/docs`。
 
 ## 几何规则与判定语义
@@ -315,4 +415,7 @@ pytest
 相交位置 / 空白名称 / 平移越界与重名的字段级错误 / 重名与偏移错误同时返回 /
 数量边界 / 与单点接口结论一致），以及断面两期比对（纯整体平移全过 / 单点真实位移定位 /
 最大位移并列取输入顺序靠前者 / 未舍入容差门槛 / 名称顺序与数量不一致拒绝 /
-组内重名 / 基准点缺失 / 负容差 / 修正后坐标越界 / 测点字段级错误）。
+组内重名 / 基准点缺失 / 负容差 / 修正后坐标越界 / 测点字段级错误），两期限界影响复核
+（纯整体平移两期结论一致 / 局部变形由合格转为不合格 / 相交净距归零 / 未舍入门槛 /
+危险边并列稳定 / 相邻测点重合与各类无效输入拒绝 / 不产生半份影响报告），
+以及 docker-compose 的 API_PORT 端口映射编排守卫。
