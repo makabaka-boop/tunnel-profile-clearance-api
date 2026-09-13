@@ -1025,6 +1025,115 @@ def main() -> int:
         types = {e["type"] for e in body["detail"]}
         check("case20h 含 too_short", "too_short" in types, str(types))
 
+    # 20i. 非法坐标与名称顺序错位并存 -> 两类错误一并返回（不遗漏并存错误）
+    cur_swap = [dict(p) for p in section_shifted]
+    cur_swap[0] = {"name": "L1", "x": -7.5, "y": 11}
+    cur_swap = [cur_swap[1], cur_swap[0]] + cur_swap[2:]
+    status, body = post(
+        "/api/profiles/clearance-impact", {**impact_base, "current_points": cur_swap}
+    )
+    check("case20i status 422（非法坐标+名称错位）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check(
+            "case20i 同时含 int_type 与 point_name_mismatch",
+            "int_type" in types and "point_name_mismatch" in types,
+            str(types),
+        )
+        check(
+            "case20i 同时定位坐标与名称分歧",
+            "current_points -> 1 -> x" in " | ".join(locs)
+            and "current_points -> 0 -> name" in " | ".join(locs),
+            str(locs),
+        )
+
+    # 20j. 车辆轮廓自交与基准期相邻测点重合并存 -> 同时标出基准期重合测点
+    dup_base = [dict(p) for p in section_baseline]
+    dup_base[2] = {"name": "C1", "x": 0, "y": 1200}
+    status, body = post(
+        "/api/profiles/clearance-impact",
+        {
+            **impact_base,
+            "baseline_points": dup_base,
+            "vehicle_polygon": {
+                "points": [
+                    {"x": 0, "y": 0},
+                    {"x": 1000, "y": 1000},
+                    {"x": 1000, "y": 0},
+                    {"x": 0, "y": 1000},
+                ]
+            },
+        },
+    )
+    check("case20j status 422（轮廓自交+基准期重合）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check(
+            "case20j 同时含 self_intersecting_polygon 与 duplicate_adjacent_point",
+            "self_intersecting_polygon" in types and "duplicate_adjacent_point" in types,
+            str(types),
+        )
+        check(
+            "case20j 标出基准期重合测点 baseline_points.2",
+            "baseline_points -> 2" in " | ".join(locs),
+            str(locs),
+        )
+
+    # 20k. 基准期点数不足与本期相邻测点重合并存 -> 同时定位本期无效折线
+    dup_cur = [dict(p) for p in section_shifted]
+    dup_cur[1] = {"name": "L2", "x": -7, "y": 11}
+    status, body = post(
+        "/api/profiles/clearance-impact",
+        {
+            **impact_base,
+            "baseline_points": section_baseline[:1],
+            "current_points": dup_cur,
+        },
+    )
+    check("case20k status 422（基准期过短+本期重合）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check(
+            "case20k 同时含 too_short 与 duplicate_adjacent_point",
+            "too_short" in types and "duplicate_adjacent_point" in types,
+            str(types),
+        )
+        check(
+            "case20k 定位本期无效折线 current_points.1",
+            "current_points -> 1" in " | ".join(locs),
+            str(locs),
+        )
+
+    # 20l. 首个测点与共同基准点仅以空控制字符（NUL）命名 -> 拒绝，不生成报告
+    status, body = post(
+        "/api/profiles/clearance-impact",
+        {
+            "baseline_points": [
+                {"name": "\x00", "x": 0, "y": 0},
+                {"name": "P1", "x": 999_000, "y": 0},
+            ],
+            "current_points": [
+                {"name": "\x00", "x": -2, "y": 0},
+                {"name": "P1", "x": 998_998, "y": 0},
+            ],
+            "reference_point": "\x00",
+            "vehicle_polygon": vehicle_rect,
+            "required_clearance": 150,
+        },
+    )
+    check("case20l status 422（仅控制字符命名）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        check(
+            "case20l 含 blank_point_name 与 blank_reference_point",
+            "blank_point_name" in types and "blank_reference_point" in types,
+            str(types),
+        )
+        check("case20l 不生成净距影响报告", "baseline" not in body and "current" not in body)
+
     print()
     if failures:
         print(f"验收失败：{len(failures)} 项")

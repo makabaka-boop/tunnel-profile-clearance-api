@@ -64,7 +64,7 @@ docker compose up --build
 python3.12 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload
-pytest                 # 106 项测试
+pytest                 # 115 项测试
 BASE_URL=http://127.0.0.1:8000 python scripts/acceptance.py
 ```
 
@@ -203,7 +203,8 @@ curl -s http://localhost:8000/api/clearance/check \
 
 批量特有的 `422` 校验（错误**定位到具体位置或偏移字段**）：
 
-- 名称仅含空白或控制字符：`blank_placement_name`，定位到 `placements.<下标>.name`；
+- 名称仅含空白或控制字符（如 NUL `\x00`，`str.strip` 不会去除控制字符）：
+  `blank_placement_name`，定位到 `placements.<下标>.name`；
 - 名称重复：`duplicate_placement_name`，定位到 `placements.<下标>.name`（重复出现的后者）；
 - 名称重复与偏移类型错误同时出现时，两个错误会一并返回；
 - 列表为空 / 超过 50 个：`too_short` / `too_long`，定位到 `placements`；
@@ -283,7 +284,9 @@ curl -s http://localhost:8000/api/profiles/compare \
 - 容差为负：`greater_than_equal`，定位到 `tolerance`；
 - 修正后坐标越过 ±1,000,000：`corrected_coordinate_out_of_range`，
   定位到 `current_points.<下标>.x` 或 `.<下标>.y`；
-- 测点名称仅含空白字符：`blank_point_name`；坐标非整数 / 越界、多余字段等同既有规则。
+- 测点名称或基准点名称仅含空白 / 控制字符（如 NUL `\x00`，`str.strip` 不会去除控制字符）：
+  `blank_point_name` / `blank_reference_point`；坐标非整数 / 越界、多余字段等同既有规则；
+- 测点字段级错误（如坐标非整数）不掩盖联合校验：名称顺序错位、基准点缺失等联合错误仍一并返回。
 
 ### `POST /api/profiles/clearance-impact`
 
@@ -381,7 +384,11 @@ curl -s http://localhost:8000/api/profiles/clearance-impact \
 - 任一期相邻测点重合（零长线段无法构成折线）：`duplicate_adjacent_point`，
   定位到 `baseline_points.<下标>` 或 `current_points.<下标>`；
 - 任一期测点少于 2 个：`too_short`，定位到对应测点列表；
-- 车辆轮廓无效（自交 / 零面积 / 重复首点等）：与 `check` 完全相同的校验规则。
+- 车辆轮廓无效（自交 / 零面积 / 重复首点等）：与 `check` 完全相同的校验规则；
+- 测点名称或基准点名称仅含空白 / 控制字符（如 NUL `\x00`）：`blank_point_name` /
+  `blank_reference_point`，分别定位到测点名称项与 `reference_point`；
+- **字段级错误不掩盖联合校验**：坐标类型错误、车辆轮廓自交、列表过短等字段级错误出现时，
+  名称顺序错位、另一期相邻测点重合等联合错误仍会一并返回（同一字段位置的同类错误不重复）。
 
 交互式文档：启动后访问 `http://localhost:8000/docs`。
 

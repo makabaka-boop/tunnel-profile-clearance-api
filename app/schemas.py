@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import unicodedata
+
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -18,6 +20,16 @@ from .geometry import polygon_is_degenerate, polygon_self_intersects
 COORD_LIMIT = 1_000_000
 MIN_POINTS_POLYLINE = 2
 MIN_POINTS_POLYGON = 3
+
+
+def _has_valid_name(value: str) -> bool:
+    """名称去掉空白与控制字符后必须仍有有效内容。
+
+    ``str.strip()`` 只去除空白（空格/制表符/换行等），NUL(\\x00) 等
+    纯控制字符不会被去除；因此额外剥离 Unicode 控制字符（类别 Cc）后再判空。
+    """
+    stripped = "".join(ch for ch in value if unicodedata.category(ch) != "Cc").strip()
+    return bool(stripped)
 
 
 def _ensure_coordinate_bounds(value: int) -> int:
@@ -194,10 +206,10 @@ class Placement(BaseModel):
     @field_validator("name")
     @classmethod
     def _check_name_not_blank(cls, value: str) -> str:
-        if not value.strip():
+        if not _has_valid_name(value):
             raise PydanticCustomError(
                 "blank_placement_name",
-                "摆放位置名称不能为空白字符，必须包含有效名称",
+                "摆放位置名称不能为空白或控制字符，必须包含有效名称",
             )
         return value
 
@@ -348,10 +360,10 @@ class ProfilePoint(BaseModel):
     @field_validator("name")
     @classmethod
     def _check_name_not_blank(cls, value: str) -> str:
-        if not value.strip():
+        if not _has_valid_name(value):
             raise PydanticCustomError(
                 "blank_point_name",
-                "测点名称不能为空白字符，必须包含有效名称",
+                "测点名称不能为空白或控制字符，必须包含有效名称",
             )
         return value
 
@@ -521,6 +533,239 @@ def _profile_pair_errors(
     return errors
 
 
+def _dict_list(value: object) -> list[dict] | None:
+    """字段值为 dict 列表时原样返回，否则返回 None（类型错误由字段级校验报告）。"""
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        return value
+    return None
+
+
+def _valid_int(value: object) -> int | None:
+    """提取严格整数（排除布尔值冒充）；非整数返回 None（由字段级校验报告）。"""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _raw_profile_pair_errors(raw: dict, *, min_points: int) -> list[dict]:
+    """从原始输入计算两期测点的联合校验错误。
+
+    字段级 / 嵌套模型级校验失败时，``mode="after"`` 模型校验不会运行，
+    联合错误（名称序列、基准点、修正后越界、相邻重合、点数下限）会被遗漏。
+    本函数直接基于原始 dict 计算这些错误，供模型级 ``wrap`` 校验器在
+    字段构造失败时一并返回；仅对结构合法的部分做检查，避免错误噪音：
+
+    - 名称序列比较只使用非空白/控制字符的有效名称，非法名称由字段级错误定位；
+    - 坐标类检查只使用在界严格整数坐标；
+    - 每组点数下限由列表长度直接判断（即使组内含脏点）。
+    """
+    errors: list[dict] = []
+
+    baseline_raw = _dict_list(raw.get("baseline_points"))
+    current_raw = _dict_list(raw.get("current_points"))
+    reference = raw.get("reference_point")
+
+    if baseline_raw is None or current_raw is None:
+        return errors
+
+    # 列表长度下限：即使组内含字段级脏点，也要同时给出后续联合错误
+    for field_name, points in (
+        ("baseline_points", baseline_raw),
+        ("current_points", current_raw),
+    ):
+        if len(points) < min_points:
+            errors.append(
+                {
+                    "type": PydanticCustomError(
+                        "too_short",
+                        f"列表至少需要 {min_points} 个项，实际有 {len(points)} 个",
+                    ),
+                    "loc": (field_name,),
+                }
+            )
+
+    # 两组名称序列必须完全一致（数量 + 顺序），定位到首个分歧。
+    # 名称非法（非字符串/空白/控制字符）时由字段级校验定位，该项不参与比对，
+    # 避免在联合错误消息里夹带非法名称
+    def _valid_name(item: dict) -> str | None:
+        name = item.get("name")
+        if isinstance(name, str) and _has_valid_name(name):
+            return name
+        return None
+
+    if len(baseline_raw) == len(current_raw):
+        for idx, (base_item, curr_item) in enumerate(zip(baseline_raw, current_raw)):
+            bn = _valid_name(base_item)
+            cn = _valid_name(curr_item)
+            if bn is not None and cn is not None and bn != cn:
+                errors.append(
+                    {
+                        "type": PydanticCustomError(
+                            "point_name_mismatch",
+                            f"第 {idx} 个测点名称不一致：基准为 '{bn}'，本期为 '{cn}'，"
+                            "两组测点名称与顺序必须完全对应",
+                        ),
+                        "loc": ("current_points", idx, "name"),
+                    }
+                )
+                break
+    else:
+        errors.append(
+            {
+                "type": PydanticCustomError(
+                    "point_count_mismatch",
+                    f"本期测点数量（{len(current_raw)}）与基准测点数量"
+                    f"（{len(baseline_raw)}）不一致，两组测点数量与名称顺序必须完全对应",
+                ),
+                "loc": ("current_points",),
+            }
+        )
+
+    # 相邻测点不得重合（零长线段无法构成折线）：坐标为在界整数即可判定，
+    # 与同项其它字段是否合法无关，故脏点并存时仍能定位无效折线
+    for field_name, label, points in (
+        ("baseline_points", "基准测点", baseline_raw),
+        ("current_points", "本期测点", current_raw),
+    ):
+        for k in range(1, len(points)):
+            ax, ay = _valid_int(points[k - 1].get("x")), _valid_int(points[k - 1].get("y"))
+            bx, by = _valid_int(points[k].get("x")), _valid_int(points[k].get("y"))
+            if (
+                ax is not None
+                and ay is not None
+                and bx is not None
+                and by is not None
+                and abs(ax) <= COORD_LIMIT
+                and abs(ay) <= COORD_LIMIT
+                and abs(bx) <= COORD_LIMIT
+                and abs(by) <= COORD_LIMIT
+                and ax == bx
+                and ay == by
+            ):
+                errors.append(
+                    {
+                        "type": PydanticCustomError(
+                            "duplicate_adjacent_point",
+                            f"{label}第 {k} 个测点与前一点重合，作为折线的相邻测点不得相同",
+                        ),
+                        "loc": (field_name, k),
+                    }
+                )
+
+    if not isinstance(reference, str) or not _has_valid_name(reference):
+        return errors
+
+    # 基准点必须同时存在于两组（只按有效字符串名称匹配；非法名称项由字段级错误定位）
+    ref_in_baseline = [
+        (idx, item)
+        for idx, item in enumerate(baseline_raw)
+        if _valid_name(item) == reference
+    ]
+    ref_in_current = [
+        (idx, item)
+        for idx, item in enumerate(current_raw)
+        if _valid_name(item) == reference
+    ]
+    if not ref_in_baseline or not ref_in_current:
+        if not ref_in_baseline and not ref_in_current:
+            msg = f"基准点 '{reference}' 在基准测点与本期测点中均不存在"
+        elif not ref_in_baseline:
+            msg = f"基准点 '{reference}' 不存在于基准测点中"
+        else:
+            msg = f"基准点 '{reference}' 不存在于本期测点中"
+        errors.append(
+            {
+                "type": PydanticCustomError("reference_point_missing", msg),
+                "loc": ("reference_point",),
+            }
+        )
+    elif len(ref_in_baseline) == 1 and len(ref_in_current) == 1:
+        # 修正后坐标不得越过既有范围（±1,000,000 毫米）：
+        # 基准点与各测点坐标均为在界整数时才计算，避免对脏数据重复报错
+        _, base_ref_item = ref_in_baseline[0]
+        _, curr_ref_item = ref_in_current[0]
+        brx = _valid_int(base_ref_item.get("x"))
+        bry = _valid_int(base_ref_item.get("y"))
+        crx = _valid_int(curr_ref_item.get("x"))
+        cry = _valid_int(curr_ref_item.get("y"))
+        if None not in (brx, bry, crx, cry):
+            dx, dy = brx - crx, bry - cry
+            for idx, item in enumerate(current_raw):
+                cx, cy = _valid_int(item.get("x")), _valid_int(item.get("y"))
+                if cx is None or cy is None:
+                    continue
+                nx, ny = cx + dx, cy + dy
+                name = _valid_name(item)
+                label = name if name is not None else f"第 {idx} 个测点"
+                if abs(nx) > COORD_LIMIT:
+                    errors.append(
+                        {
+                            "type": PydanticCustomError(
+                                "corrected_coordinate_out_of_range",
+                                f"测点 {label} 修正后 x 坐标为 {nx}，"
+                                f"绝对值不得超过 {COORD_LIMIT} 毫米",
+                            ),
+                            "loc": ("current_points", idx, "x"),
+                        }
+                    )
+                if abs(ny) > COORD_LIMIT:
+                    errors.append(
+                        {
+                            "type": PydanticCustomError(
+                                "corrected_coordinate_out_of_range",
+                                f"测点 {label} 修正后 y 坐标为 {ny}，"
+                                f"绝对值不得超过 {COORD_LIMIT} 毫米",
+                            ),
+                            "loc": ("current_points", idx, "y"),
+                        }
+                    )
+
+    return errors
+
+
+def _run_model_with_raw_joint_errors(
+    cls: type, value: object, handler, *, min_points: int
+):
+    """模型级 wrap 校验：字段级失败时仍从原始输入补算联合校验错误。
+
+    正常路径（全部字段构造成功）交给原 ``mode="after"`` 校验器，其语义
+    与既有行为完全一致；字段级 / 嵌套模型级失败时，handler 抛出
+    ValidationError，本函数重建错误列表并追加基于原始数据的联合错误，
+    按 (类型, loc) 去重：同一字段位置的同类错误只保留首个字段级错误，
+    避免与原校验器或字段 wrap 校验器重复。
+    """
+    try:
+        return handler(value)
+    except ValidationError as exc:
+        line_errors: list[dict] = []
+        seen_keys: set[tuple] = set()
+
+        def _add(error_type, msg: str, loc: tuple) -> None:
+            # 同一 loc 上的同类错误只保留首个：字段级错误先入列并保留其
+            # 标准消息（如 too_short），原始补算的重复联合错误不再追加
+            key = (str(error_type), loc)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                line_errors.append(
+                    {
+                        "type": PydanticCustomError(str(error_type), str(msg)),
+                        "loc": loc,
+                    }
+                )
+
+        for error in exc.errors():
+            loc = tuple(part for part in error.get("loc", ()) if part != "")
+            _add(error["type"], error["msg"], loc)
+
+        if isinstance(value, dict):
+            for error in _raw_profile_pair_errors(value, min_points=min_points):
+                custom_error: PydanticCustomError = error["type"]
+                loc = tuple(error["loc"])
+                _add(custom_error.type, custom_error.message, loc)
+
+        raise ValidationError.from_exception_data(cls.__name__, line_errors) from exc
+
+
 class ProfileCompareRequest(BaseModel):
     """同一断面两期测点比对请求：两组测点按名称一一对应（数量、顺序完全一致）。"""
 
@@ -555,6 +800,23 @@ class ProfileCompareRequest(BaseModel):
     def _validate_current_points_field(cls, value: object, handler) -> list[ProfilePoint]:
         return _validate_named_points_field(
             value, handler, field_name="current_points", owner_name=cls.__name__
+        )
+
+    @field_validator("reference_point")
+    @classmethod
+    def _check_reference_point_not_blank(cls, value: str) -> str:
+        if not _has_valid_name(value):
+            raise PydanticCustomError(
+                "blank_reference_point",
+                "基准点名称不能为空白或控制字符，必须包含有效名称",
+            )
+        return value
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _merge_field_and_joint_errors(cls, data, handler):
+        return _run_model_with_raw_joint_errors(
+            cls, data, handler, min_points=1
         )
 
     @model_validator(mode="after")
@@ -603,6 +865,23 @@ class ClearanceImpactRequest(BaseModel):
     def _validate_current_points_field(cls, value: object, handler) -> list[ProfilePoint]:
         return _validate_named_points_field(
             value, handler, field_name="current_points", owner_name=cls.__name__
+        )
+
+    @field_validator("reference_point")
+    @classmethod
+    def _check_reference_point_not_blank(cls, value: str) -> str:
+        if not _has_valid_name(value):
+            raise PydanticCustomError(
+                "blank_reference_point",
+                "基准点名称不能为空白或控制字符，必须包含有效名称",
+            )
+        return value
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _merge_field_and_joint_errors(cls, data, handler):
+        return _run_model_with_raw_joint_errors(
+            cls, data, handler, min_points=MIN_POINTS_POLYLINE
         )
 
     @model_validator(mode="after")

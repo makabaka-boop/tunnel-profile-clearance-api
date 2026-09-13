@@ -1,5 +1,6 @@
 """两期限界影响复核 /api/profiles/clearance-impact 的行为测试（TestClient）。"""
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -315,3 +316,131 @@ def test_multiple_errors_reported_together():
     assert "duplicate_adjacent_point" in types
     assert "point_name_mismatch" in types
     assert "baseline" not in resp.json()
+
+
+# ---------- 字段级错误与联合错误并存（不得遗漏并存错误） ----------
+
+
+def test_invalid_coordinate_and_name_order_mismatch_reported_together():
+    # 非法坐标（浮点）使本期测点字段构造失败，名称顺序错位的联合错误
+    # 不得因此被遗漏：坐标类型错误与 point_name_mismatch 一并返回
+    current = [dict(p) for p in ARCH_SHIFTED]
+    current[0] = {"name": "L1", "x": -7.5, "y": 11}  # x 非整数
+    current = [current[1], current[0]] + current[2:]  # 前两项顺序错位
+    resp = post_impact(impact_payload(current))
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    types = {e["type"] for e in detail}
+    assert "int_type" in types
+    assert "point_name_mismatch" in types
+    locs = _locs(resp)
+    assert "body -> current_points -> 1 -> x" in locs
+    assert "body -> current_points -> 0 -> name" in locs
+    assert "baseline" not in resp.json()
+
+
+def test_self_intersecting_vehicle_and_baseline_duplicate_reported_together():
+    # 车辆轮廓自交（嵌套模型构造失败）与基准期相邻测点重合并存时，
+    # 不得只报轮廓自交；基准期重合测点必须准确定位
+    baseline = [dict(p) for p in ARCH_BASELINE]
+    baseline[2] = {"name": "C1", "x": 0, "y": 1200}  # 与 L2 重合
+    bowtie = {
+        "points": [
+            {"x": 0, "y": 0},
+            {"x": 1000, "y": 1000},
+            {"x": 1000, "y": 0},
+            {"x": 0, "y": 1000},
+        ]
+    }
+    resp = post_impact(impact_payload(ARCH_SHIFTED, baseline=baseline, vehicle=bowtie))
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    types = {e["type"] for e in detail}
+    assert "self_intersecting_polygon" in types
+    assert "duplicate_adjacent_point" in types
+    assert "body -> baseline_points -> 2" in _locs(resp)
+    assert "baseline" not in resp.json()
+
+
+def test_too_few_baseline_points_and_current_duplicate_reported_together():
+    # 基准期只有 1 点（too_short）与本期相邻测点重合并存时，
+    # 不得只反馈基准期列表过短；本期无效折线必须一并定位
+    current = [dict(p) for p in ARCH_SHIFTED]
+    current[1] = {"name": "L2", "x": -7, "y": 11}  # 与第 0 点重合
+    resp = post_impact(
+        impact_payload(current, baseline=ARCH_BASELINE[:1])
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    types = {e["type"] for e in detail}
+    assert "too_short" in types
+    assert "point_count_mismatch" in types
+    assert "duplicate_adjacent_point" in types
+    assert "body -> current_points -> 1" in _locs(resp)
+    assert "baseline" not in resp.json()
+
+
+@pytest.mark.parametrize("control_name", ["\x00", "\x01", "\x1f", "\x7f"])
+def test_control_only_point_and_reference_names_rejected(control_name):
+    # 两期首个测点与共同基准点仅以空控制字符命名时，必须拒绝，
+    # 不得生成完整净距影响报告（str.strip 不会去除 NUL 等控制字符）
+    baseline = [
+        {"name": control_name, "x": 0, "y": 0},
+        {"name": "P1", "x": 999_000, "y": 0},
+    ]
+    current = [
+        {"name": control_name, "x": -2, "y": 0},
+        {"name": "P1", "x": 998_998, "y": 0},
+    ]
+    payload = impact_payload(
+        current, baseline=baseline, reference=control_name, required=150
+    )
+    resp = post_impact(payload)
+    assert resp.status_code == 422
+    types = {e["type"] for e in resp.json()["detail"]}
+    assert "blank_point_name" in types
+    assert "blank_reference_point" in types
+    locs = _locs(resp)
+    assert "body -> baseline_points -> 0 -> name" in locs
+    assert "body -> current_points -> 0 -> name" in locs
+    assert "body -> reference_point" in locs
+    assert "baseline" not in resp.json() and "current" not in resp.json()
+
+
+def test_name_with_valid_content_alongside_control_char_allowed():
+    # 含控制字符但同时含有效名称内容的名称不视为空名称（只拒绝"无有效名称"）
+    baseline = [
+        {"name": "R\x001", "x": 0, "y": 0},
+        {"name": "P1", "x": 999_000, "y": 0},
+    ]
+    current = [
+        {"name": "R\x001", "x": -2, "y": 0},
+        {"name": "P1", "x": 998_998, "y": 0},
+    ]
+    resp = post_impact(
+        impact_payload(current, baseline=baseline, reference="R\x001", required=150)
+    )
+    assert resp.status_code == 200
+    assert resp.json()["clearance_change_mm"] == 0.0
+
+
+def test_control_only_names_also_rejected_on_compare_endpoint():
+    # 同一有效名称规则在断面比对接口同样生效（请求校验与影响复核共用模型）
+    payload = {
+        "baseline_points": [
+            {"name": "\x00", "x": 0, "y": 0},
+            {"name": "P1", "x": 100, "y": 0},
+        ],
+        "current_points": [
+            {"name": "\x00", "x": 0, "y": 0},
+            {"name": "P1", "x": 100, "y": 0},
+        ],
+        "reference_point": "\x00",
+        "tolerance": 5,
+    }
+    resp = client.post("/api/profiles/compare", json=payload)
+    assert resp.status_code == 422
+    types = {e["type"] for e in resp.json()["detail"]}
+    assert "blank_point_name" in types
+    assert "blank_reference_point" in types
+

@@ -661,7 +661,7 @@ def test_series_translated_coordinate_out_of_range():
 
 
 def test_series_blank_placement_name_rejected():
-    for name in [" ", "\t", "\n", "\r\n", " "]:
+    for name in [" ", "\t", "\n", "\r\n", " ", "\x00", "\x1f"]:
         resp = post_series(series_payload([{"name": name, "dx": 0, "dy": 0}]))
         assert resp.status_code == 422
         detail = resp.json()["detail"]
@@ -1043,11 +1043,12 @@ def test_compare_point_field_types():
     assert resp.status_code == 422
     assert any(e["type"] == "coordinate_out_of_range" for e in resp.json()["detail"])
 
-    # 空白名称
-    resp = post_compare(compare_payload([{"name": "  ", "x": 0, "y": 0}]))
-    assert resp.status_code == 422
-    assert any(e["type"] == "blank_point_name" for e in resp.json()["detail"])
-    assert "body -> current_points -> 0 -> name" in _locs(resp)
+    # 空白 / 仅控制字符名称
+    for blank in ["  ", "\x00", "\x1f"]:
+        resp = post_compare(compare_payload([{"name": blank, "x": 0, "y": 0}]))
+        assert resp.status_code == 422
+        assert any(e["type"] == "blank_point_name" for e in resp.json()["detail"])
+        assert "body -> current_points -> 0 -> name" in _locs(resp)
 
     # 多余字段
     resp = post_compare(compare_payload([{"name": "L1", "x": 0, "y": 0, "z": 1}]))
