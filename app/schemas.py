@@ -373,10 +373,46 @@ class ProfilePoint(BaseModel):
         return _ensure_coordinate_bounds(value)
 
 
+class ControlPoint(BaseModel):
+    """单个控制点：组内唯一名称 + 毫米整数坐标（拱顶 / 侧墙 / 设备邻近点等）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, description="控制点名称，同一请求内唯一")
+    x: StrictInt = Field(..., description="X 坐标（毫米，|x| <= 1,000,000）")
+    y: StrictInt = Field(..., description="Y 坐标（毫米，|y| <= 1,000,000）")
+
+    @field_validator("name")
+    @classmethod
+    def _check_name_not_blank(cls, value: str) -> str:
+        if not _has_valid_name(value):
+            raise PydanticCustomError(
+                "blank_control_point_name",
+                "控制点名称不能为空白或控制字符，必须包含有效名称",
+            )
+        return value
+
+    @field_validator("x", "y")
+    @classmethod
+    def _check_bounds(cls, value: int) -> int:
+        return _ensure_coordinate_bounds(value)
+
+
 def _validate_named_points_field(
-    value: object, handler, *, field_name: str, owner_name: str
+    value: object,
+    handler,
+    *,
+    field_name: str,
+    owner_name: str,
+    name_label: str = "测点",
+    duplicate_type: str = "duplicate_point_name",
 ) -> list[ProfilePoint]:
-    """校验测点列表，并在嵌套字段错误时仍收集组内重名错误。"""
+    """校验命名点列表，并在嵌套字段错误时仍收集组内重名错误。
+
+    name_label 用于组内重名错误消息中的人类可读名称（测点 / 控制点）；
+    duplicate_type 为重名错误类型（duplicate_point_name /
+    duplicate_control_point_name）。
+    """
     try:
         return handler(value)
     except ValidationError as exc:
@@ -395,8 +431,9 @@ def _validate_named_points_field(
                     line_errors.append(
                         {
                             "type": PydanticCustomError(
-                                "duplicate_point_name",
-                                f"测点名称重复：{name}（首次出现于第 {first} 个测点），同组内名称必须唯一",
+                                duplicate_type,
+                                f"{name_label}名称重复：{name}（首次出现于第 {first} 个{name_label}），"
+                                "同组内名称必须唯一",
                             ),
                             "loc": (idx, "name"),
                         }
@@ -913,6 +950,61 @@ class ClearanceImpactRequest(BaseModel):
         return self
 
 
+class CoverageRequest(BaseModel):
+    """控制点覆盖复核请求：测量折线（按序连接、不闭合）+ 命名控制点列表 + 覆盖半径。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    measured_polyline: TunnelProfile
+    control_points: list[ControlPoint] = Field(
+        ...,
+        min_length=1,
+        description="设计指定的控制点列表（至少 1 个），名称非空白且同一请求内唯一，按输入顺序逐一复核",
+    )
+    coverage_radius: StrictInt = Field(
+        ...,
+        ge=0,
+        description="覆盖半径（毫米，非负整数）；未舍入最短距离 <= 半径判为已覆盖",
+    )
+
+    @field_validator("control_points", mode="wrap")
+    @classmethod
+    def _validate_control_points_field(cls, value: object, handler) -> list[ControlPoint]:
+        return _validate_named_points_field(
+            value,
+            handler,
+            field_name="control_points",
+            owner_name=cls.__name__,
+            name_label="控制点",
+            duplicate_type="duplicate_control_point_name",
+        )
+
+    @model_validator(mode="after")
+    def _validate_control_points(self) -> "CoverageRequest":
+        # 名称在同一请求内唯一（定位到重复出现的后者）
+        errors: list[dict] = []
+        seen: dict[str, int] = {}
+        for idx, point in enumerate(self.control_points):
+            first = seen.get(point.name)
+            if first is not None:
+                errors.append(
+                    {
+                        "type": PydanticCustomError(
+                            "duplicate_control_point_name",
+                            f"控制点名称重复：{point.name}（首次出现于第 {first} 个控制点），"
+                            "同组内名称必须唯一",
+                        ),
+                        "loc": ("control_points", idx, "name"),
+                    }
+                )
+            else:
+                seen[point.name] = idx
+
+        if errors:
+            raise ValidationError.from_exception_data(self.__class__.__name__, errors)
+        return self
+
+
 class PointOut(BaseModel):
     x: int
     y: int
@@ -1007,3 +1099,29 @@ class ClearanceImpactResponse(BaseModel):
     became_noncompliant: bool = Field(
         ..., description="基准期合格而本期不合格（由合格转为不合格）时为 true"
     )
+
+
+class PointCoverageOut(BaseModel):
+    """单个控制点的覆盖结论，顺序与输入控制点一一对应。"""
+
+    name: str = Field(..., description="对应输入控制点的名称")
+    distance_mm: float = Field(
+        ..., description="控制点到测量折线的最短距离（毫米，保留三位小数）"
+    )
+    nearest_segment_start_index: int = Field(
+        ...,
+        description="最近线段的起点索引（折线点序列下标）；距离差不超过 1e-9 的并列取较小者",
+    )
+    covered: bool = Field(
+        ..., description="未舍入最短距离 <= 覆盖半径时为 true（恰好落在半径边界上也算覆盖）"
+    )
+
+
+class CoverageResponse(BaseModel):
+    """控制点覆盖复核报告：points 与输入控制点按顺序一一对应。"""
+
+    points: list[PointCoverageOut]
+    first_uncovered_name: str | None = Field(
+        ..., description="首个未覆盖控制点的名称；全部覆盖时为 null"
+    )
+    all_covered: bool = Field(..., description="全部控制点均被有效覆盖时为 true")

@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from .comparison import align_to_reference, compare_profiles
+from .coverage import analyze_coverage
 from .geometry import minimum_segment_pair, round_three
 from .schemas import (
     ClearanceImpactRequest,
@@ -15,8 +16,11 @@ from .schemas import (
     ClearanceSeriesResponse,
     ComparedPointOut,
     CorrectionOut,
+    CoverageRequest,
+    CoverageResponse,
     DangerousPair,
     PlacementResult,
+    PointCoverageOut,
     PointOut,
     ProfileCompareRequest,
     ProfileCompareResponse,
@@ -25,8 +29,8 @@ from .schemas import (
 
 app = FastAPI(
     title="隧道限界复核 API",
-    version="1.3.0",
-    description="纯后端 JSON API：计算隧道折线与车辆限界多边形之间的全局最小净距，支持单点与批量平移位置复核；支持同一断面两期测点的基准点对齐比对，以及两期测点折线的限界净距影响复核。",
+    version="1.4.0",
+    description="纯后端 JSON API：计算隧道折线与车辆限界多边形之间的全局最小净距，支持单点与批量平移位置复核；支持同一断面两期测点的基准点对齐比对，两期测点折线的限界净距影响复核，以及设计控制点对激光测量轨迹的覆盖复核。",
 )
 
 
@@ -161,4 +165,26 @@ def clearance_impact(req: ClearanceImpactRequest) -> ClearanceImpactResponse:
         # 净距变化值基于未舍入距离求差，输出再舍入到三位小数
         clearance_change_mm=round_three(current_distance - baseline_distance),
         became_noncompliant=baseline_conclusion.passed and not current_conclusion.passed,
+    )
+
+
+@app.post("/api/profiles/coverage", response_model=CoverageResponse)
+def profile_coverage(req: CoverageRequest) -> CoverageResponse:
+    # 模型层已保证：测量折线不少于 2 点且相邻不重合、控制点名称非空白且唯一、
+    # 列表非空、覆盖半径非负；覆盖服务只负责纯计算
+    polyline = [(float(p.x), float(p.y)) for p in req.measured_polyline.points]
+    control_points = [(p.name, float(p.x), float(p.y)) for p in req.control_points]
+    result = analyze_coverage(polyline, control_points, req.coverage_radius)
+    return CoverageResponse(
+        points=[
+            PointCoverageOut(
+                name=point.name,
+                distance_mm=point.distance_mm,
+                nearest_segment_start_index=point.nearest_segment_start_index,
+                covered=point.covered,
+            )
+            for point in result.points
+        ],
+        first_uncovered_name=result.first_uncovered_name,
+        all_covered=result.all_covered,
     )

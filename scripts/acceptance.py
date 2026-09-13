@@ -1134,6 +1134,247 @@ def main() -> int:
         )
         check("case20l 不生成净距影响报告", "baseline" not in body and "current" not in body)
 
+    # 21. 控制点覆盖复核：拱顶 / 侧墙 / 设备邻近控制点全部被测量轨迹有效覆盖
+    coverage_polyline = {
+        "points": [
+            {"x": 0, "y": 0},
+            {"x": 0, "y": 1200},
+            {"x": 1000, "y": 1200},
+            {"x": 1000, "y": 0},
+        ]
+    }
+    status, body = post(
+        "/api/profiles/coverage",
+        {
+            "measured_polyline": coverage_polyline,
+            "control_points": [
+                {"name": "拱顶", "x": 500, "y": 1400},
+                {"name": "侧墙", "x": 200, "y": 600},
+                {"name": "设备邻近", "x": 1000, "y": 200},
+            ],
+            "coverage_radius": 200,
+        },
+    )
+    check("case21 status 200", status == 200, str(body))
+    if status == 200:
+        check(
+            "case21 结果按输入顺序返回",
+            [p["name"] for p in body["points"]] == ["拱顶", "侧墙", "设备邻近"],
+            json.dumps(body["points"], ensure_ascii=False),
+        )
+        check(
+            "case21 距离 200/200/0 且最近线段起点索引 1/0/2",
+            [p["distance_mm"] for p in body["points"]] == [200.0, 200.0, 0.0]
+            and [p["nearest_segment_start_index"] for p in body["points"]] == [1, 0, 2],
+            json.dumps(body["points"], ensure_ascii=False),
+        )
+        check("case21 全部覆盖", body["all_covered"] is True)
+        check("case21 first_uncovered_name 为 null", body["first_uncovered_name"] is None)
+        check("case21 各点 covered 均为 true", all(p["covered"] for p in body["points"]))
+
+    # 22. 首个遗漏：遗漏点不中断批次，仍返回完整结果并汇总首个未覆盖名称
+    status, body = post(
+        "/api/profiles/coverage",
+        {
+            "measured_polyline": coverage_polyline,
+            "control_points": [
+                {"name": "拱顶-已覆盖", "x": 500, "y": 1400},
+                {"name": "侧墙-遗漏", "x": 500, "y": -100},
+                {"name": "设备-已覆盖", "x": 1000, "y": 200},
+            ],
+            "coverage_radius": 200,
+        },
+    )
+    check("case22 status 200", status == 200, str(body))
+    if status == 200:
+        check("case22 all_covered=false", body["all_covered"] is False)
+        check(
+            "case22 first_uncovered_name=侧墙-遗漏",
+            body["first_uncovered_name"] == "侧墙-遗漏",
+        )
+        check(
+            "case22 覆盖标记 [true, false, true]，报告完整",
+            [p["covered"] for p in body["points"]] == [True, False, True]
+            and len(body["points"]) == 3,
+            json.dumps(body["points"], ensure_ascii=False),
+        )
+        check(
+            "case22 遗漏点距离 509.902，两底角并列取线段0",
+            approx(body["points"][1]["distance_mm"], 509.902)
+            and body["points"][1]["nearest_segment_start_index"] == 0,
+            json.dumps(body["points"][1], ensure_ascii=False),
+        )
+
+    # 23. 并列线段选择稳定：相邻线段共享端点等距时取起点索引较小者；
+    # 未舍入距离判定半径边界（sqrt(2) 显示 1.414，半径 1 不覆盖、半径 2 覆盖）
+    tie_polyline = {
+        "points": [
+            {"x": 0, "y": 0},
+            {"x": 100, "y": 0},
+            {"x": 200, "y": 0},
+        ]
+    }
+    status, body = post(
+        "/api/profiles/coverage",
+        {
+            "measured_polyline": tie_polyline,
+            "control_points": [{"name": "joint", "x": 100, "y": -50}],
+            "coverage_radius": 100,
+        },
+    )
+    check("case23a status 200", status == 200, str(body))
+    if status == 200:
+        check(
+            "case23a 并列 50mm 取起点索引 0",
+            approx(body["points"][0]["distance_mm"], 50.0)
+            and body["points"][0]["nearest_segment_start_index"] == 0,
+            json.dumps(body["points"][0]),
+        )
+
+    # 交换两条线段顺序后，并列选择跟随到新的起点索引 0
+    status, body = post(
+        "/api/profiles/coverage",
+        {
+            "measured_polyline": {
+                "points": [
+                    {"x": 200, "y": 0},
+                    {"x": 100, "y": 0},
+                    {"x": 0, "y": 0},
+                ]
+            },
+            "control_points": [{"name": "joint", "x": 100, "y": -50}],
+            "coverage_radius": 100,
+        },
+    )
+    check("case23b 交换顺序后并列仍取索引 0", status == 200 and body["points"][0]["nearest_segment_start_index"] == 0, str(body))
+
+    diag_polyline = {"points": [{"x": 0, "y": 0}, {"x": 1000, "y": 0}]}
+    status, body = post(
+        "/api/profiles/coverage",
+        {
+            "measured_polyline": diag_polyline,
+            "control_points": [{"name": "p", "x": 1001, "y": 1}],
+            "coverage_radius": 1,
+        },
+    )
+    check("case23c status 200", status == 200, str(body))
+    if status == 200:
+        check(
+            "case23c 未舍入 sqrt(2)>1：显示 1.414 但不覆盖",
+            approx(body["points"][0]["distance_mm"], 1.414)
+            and body["points"][0]["covered"] is False
+            and body["all_covered"] is False,
+            json.dumps(body["points"][0]),
+        )
+    status, body = post(
+        "/api/profiles/coverage",
+        {
+            "measured_polyline": diag_polyline,
+            "control_points": [{"name": "p", "x": 1001, "y": 1}],
+            "coverage_radius": 2,
+        },
+    )
+    check(
+        "case23d 同一几何半径 2 覆盖；距离恰好等于半径也判覆盖",
+        status == 200 and body["points"][0]["covered"] is True and body["all_covered"] is True,
+        str(body),
+    )
+    status, body = post(
+        "/api/profiles/coverage",
+        {
+            "measured_polyline": diag_polyline,
+            "control_points": [{"name": "edge", "x": 0, "y": 10}],
+            "coverage_radius": 10,
+        },
+    )
+    check(
+        "case23e 距离恰好等于半径判覆盖",
+        status == 200 and body["points"][0]["covered"] is True,
+        str(body),
+    )
+
+    # 24. 无效测量折线 / 控制点 / 半径 -> 422 并定位字段，不生成任何部分报告
+    status, body = post(
+        "/api/profiles/coverage",
+        {
+            "measured_polyline": {"points": [{"x": 0, "y": 0}]},
+            "control_points": [
+                {"name": "a", "x": 0, "y": 0},
+                {"name": "a", "x": 1, "y": 1},
+                {"name": "  \t\n", "x": 2, "y": 2},
+            ],
+            "coverage_radius": -5,
+        },
+    )
+    check("case24a status 422（多类错误一次返回）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        joined = " | ".join(locs)
+        check("case24a 含 too_few_points", "too_few_points" in types, str(types))
+        check(
+            "case24a 含 duplicate_control_point_name / blank_control_point_name / 半径越界",
+            {"duplicate_control_point_name", "blank_control_point_name", "greater_than_equal"} <= types,
+            str(types),
+        )
+        check(
+            "case24a 定位 measured_polyline.points 与 control_points.1.name / .2.name / coverage_radius",
+            "measured_polyline -> points" in joined
+            and "control_points -> 1 -> name" in joined
+            and "control_points -> 2 -> name" in joined
+            and "coverage_radius" in joined,
+            joined,
+        )
+        check("case24a 不生成部分报告", "points" not in body and "first_uncovered_name" not in body)
+
+    # 相邻重合点 + 空控制点列表 + 非法半径类型
+    status, body = post(
+        "/api/profiles/coverage",
+        {
+            "measured_polyline": {"points": [{"x": 0, "y": 0}, {"x": 0, "y": 0}]},
+            "control_points": [],
+            "coverage_radius": 1.5,
+        },
+    )
+    check("case24b status 422（重合点/空列表/半径非整数）", status == 422, str(body))
+    if status == 422:
+        types = {e["type"] for e in body["detail"]}
+        locs = [" -> ".join(str(p) for p in e["loc"]) for e in body["detail"]]
+        check(
+            "case24b 含 duplicate_adjacent_point / too_short / int_type",
+            {"duplicate_adjacent_point", "too_short", "int_type"} <= types,
+            str(types),
+        )
+        check(
+            "case24b 定位 measured_polyline.points.1 与 control_points",
+            "measured_polyline -> points -> 1" in " | ".join(locs)
+            and "body -> control_points" in locs,
+            str(locs),
+        )
+        check("case24b 不生成部分报告", "points" not in body)
+
+    # 半径 0 合法：仅轨迹上的点算覆盖
+    status, body = post(
+        "/api/profiles/coverage",
+        {
+            "measured_polyline": diag_polyline,
+            "control_points": [
+                {"name": "on", "x": 500, "y": 0},
+                {"name": "off", "x": 500, "y": 1},
+            ],
+            "coverage_radius": 0,
+        },
+    )
+    check("case24c status 200（半径 0 合法）", status == 200, str(body))
+    if status == 200:
+        check(
+            "case24c 零半径只覆盖轨迹上的点",
+            [p["covered"] for p in body["points"]] == [True, False]
+            and body["first_uncovered_name"] == "off"
+            and body["all_covered"] is False,
+            json.dumps(body["points"], ensure_ascii=False),
+        )
+
     print()
     if failures:
         print(f"验收失败：{len(failures)} 项")
